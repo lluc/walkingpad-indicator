@@ -11,6 +11,8 @@ Usage:
 """
 
 import asyncio
+import datetime
+import json
 import logging
 import os
 import signal
@@ -125,6 +127,9 @@ class WalkingPadIndicator:
     SCAN_TIMEOUT_S       = 8.0
 
     CACHE_FILE = Path.home() / ".local" / "share" / "walkingpad-indicator" / "device_address.txt"
+    LOG_FILE   = Path.home() / ".local" / "share" / "walkingpad-indicator" / "activity.log"
+
+    MIN_LOG_DISTANCE_M = 10  # ignorer les sessions < 10 m (tapis allumé mais pas de marche)
 
     LABEL_DISCONNECTED = "WP: --"
     LABEL_SCANNING     = "WP: scan..."
@@ -145,6 +150,13 @@ class WalkingPadIndicator:
 
         # --- données tapis (mises à jour depuis le thread BLE, lues par GTK via idle_add) ---
         self._treadmill_data: dict = {}   # speed, distance, time, steps
+
+        # --- suivi de session (thread BLE uniquement) ---
+        self._session_start:       Optional[datetime.datetime] = None
+        self._session_data_start:  Optional[dict]              = None
+        self._session_max_speed:   float                       = 0.0
+        self._session_speed_sum:   float                       = 0.0
+        self._session_speed_count: int                         = 0
 
         self._running   = True
         self._connected = False
@@ -274,12 +286,25 @@ class WalkingPadIndicator:
     async def _connect_and_listen(self, address: str) -> None:
         """Connexion BLE : FTMS (vitesse/distance/temps) + KingSmith custom (pas)."""
         logging.info("Connexion à %s…", address)
-        self._treadmill_data = {}
+        self._treadmill_data      = {}
+        self._session_start       = datetime.datetime.now()
+        self._session_data_start  = None
+        self._session_max_speed   = 0.0
+        self._session_speed_sum   = 0.0
+        self._session_speed_count = 0
 
         def on_ftms_data(_sender, data: bytearray) -> None:
             parsed = parse_treadmill_data(data)
             if parsed:
                 self._treadmill_data.update(parsed)
+                # Capture le snapshot initial dès que la distance est disponible
+                if self._session_data_start is None and 'distance' in parsed:
+                    self._session_data_start = dict(self._treadmill_data)
+                speed = parsed.get('speed', 0.0)
+                if speed > 0:
+                    self._session_max_speed    = max(self._session_max_speed, speed)
+                    self._session_speed_sum   += speed
+                    self._session_speed_count += 1
                 GLib.idle_add(self._update_label)
 
         async with bleak.BleakClient(address) as client:
@@ -298,6 +323,7 @@ class WalkingPadIndicator:
 
         self._ble_client = None
         logging.info("Déconnecté de %s.", address)
+        self._log_session()
 
     async def _ble_shutdown(self) -> None:
         if self._ble_client and self._connected:
@@ -305,6 +331,50 @@ class WalkingPadIndicator:
                 await self._ble_client.disconnect()
             except Exception:
                 pass
+
+    def _log_session(self) -> None:
+        """Écrit une entrée JSONL dans activity.log à la fin de chaque connexion BLE."""
+        if not self._session_start or not self._session_data_start:
+            return
+
+        data_end   = self._treadmill_data
+        data_start = self._session_data_start
+
+        distance_delta = data_end.get('distance', 0) - data_start.get('distance', 0)
+        steps_delta    = data_end.get('steps',    0) - data_start.get('steps',    0)
+
+        if distance_delta < self.MIN_LOG_DISTANCE_M:
+            return
+
+        end_time   = datetime.datetime.now()
+        duration_s = int((end_time - self._session_start).total_seconds())
+        avg_speed  = (
+            round(self._session_speed_sum / self._session_speed_count, 2)
+            if self._session_speed_count else 0.0
+        )
+
+        entry = {
+            "date":          self._session_start.strftime("%Y-%m-%d"),
+            "start":         self._session_start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "end":           end_time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "duration_s":    duration_s,
+            "distance_m":    max(0, distance_delta),
+            "steps":         max(0, steps_delta),
+            "max_speed_kmh": round(self._session_max_speed, 1),
+            "avg_speed_kmh": avg_speed,
+        }
+
+        try:
+            self.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with self.LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+            logging.info(
+                "Session enregistrée : %.2fkm  %d stp  vitesse moy %.1fkm/h  [%s → %s]",
+                distance_delta / 1000, max(0, steps_delta), avg_speed,
+                entry["start"][11:], entry["end"][11:],
+            )
+        except Exception as exc:
+            logging.warning("Impossible d'écrire le log d'activité : %s", exc)
 
     # ------------------------------------------------------------------
     # Scan / cache
