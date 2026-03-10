@@ -93,6 +93,37 @@ Clic sur l'icône dans la barre → menu avec :
 - **Redémarrer** — reconnexion BLE propre (utile si le tapis a été mis en veille)
 - **Quitter** — arrêt complet
 
+## Log d'activité
+
+Chaque session de marche est automatiquement enregistrée dans :
+
+```
+~/.local/share/walkingpad-indicator/activity.log
+```
+
+Format : une entrée JSON par ligne (JSONL), ajoutée à la déconnexion du tapis.
+
+```json
+{"date": "2026-03-10", "start": "2026-03-10T09:15:00", "end": "2026-03-10T09:45:23", "duration_s": 1823, "distance_m": 2410, "steps": 3102, "max_speed_kmh": 4.5, "avg_speed_kmh": 3.82}
+```
+
+Les sessions de moins de 10 m ne sont pas enregistrées (tapis allumé sans marche).
+
+Exemples d'exploitation :
+
+```bash
+# Afficher toutes les sessions
+cat ~/.local/share/walkingpad-indicator/activity.log | python3 -c "
+import sys, json
+for line in sys.stdin:
+    s = json.loads(line)
+    print(f\"{s['date']}  {s['start'][11:16]}–{s['end'][11:16]}  {s['distance_m']/1000:.2f}km  {s['steps']}stp  moy {s['avg_speed_kmh']}km/h\")
+"
+
+# Distance totale (jq)
+jq -s '[.[].distance_m] | add / 1000' ~/.local/share/walkingpad-indicator/activity.log
+```
+
 ## Protocole technique
 
 Le tapis expose le service **FTMS** (Fitness Machine Service, UUID `0x1826`) standard Bluetooth. Les données sont reçues via des notifications sur la caractéristique **Treadmill Data** (`0x2ACD`) à environ 1 Hz.
