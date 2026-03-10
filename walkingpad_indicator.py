@@ -307,23 +307,24 @@ class WalkingPadIndicator:
                     self._session_speed_count += 1
                 GLib.idle_add(self._update_label)
 
-        async with bleak.BleakClient(address) as client:
-            self._ble_client = client
-            self._connected  = True
-            logging.info("Connecté !")
-            self._save_cached_address(address)
+        try:
+            async with bleak.BleakClient(address) as client:
+                self._ble_client = client
+                self._connected  = True
+                logging.info("Connecté !")
+                self._save_cached_address(address)
 
-            await client.start_notify(TREADMILL_DATA_UUID, on_ftms_data)
-            logging.info("Notifications FTMS activées (vitesse, distance, durée, pas).")
+                await client.start_notify(TREADMILL_DATA_UUID, on_ftms_data)
+                logging.info("Notifications FTMS activées (vitesse, distance, durée, pas).")
 
-            while self._running and client.is_connected:
-                await asyncio.sleep(1.0)
+                while self._running and client.is_connected:
+                    await asyncio.sleep(1.0)
 
-            await client.stop_notify(TREADMILL_DATA_UUID)
-
-        self._ble_client = None
-        logging.info("Déconnecté de %s.", address)
-        self._log_session()
+                await client.stop_notify(TREADMILL_DATA_UUID)
+        finally:
+            self._ble_client = None
+            logging.info("Déconnecté de %s.", address)
+            self._log_session()
 
     async def _ble_shutdown(self) -> None:
         if self._ble_client and self._connected:
