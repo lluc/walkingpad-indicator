@@ -22,7 +22,7 @@ Affiche en temps réel les données d'un tapis de marche KingSmith/WalkingPad da
 
 ```bash
 python3 -m venv --system-site-packages ~/.local/share/walkingpad-venv
-~/.local/share/walkingpad-venv/bin/pip install bleak
+~/.local/share/walkingpad-venv/bin/pip install bleak matplotlib
 ```
 
 > `--system-site-packages` est obligatoire pour accéder à `python3-gi` (GTK3).
@@ -90,8 +90,33 @@ L'indicateur démarre automatiquement 5 secondes après la connexion de session.
 ## Menu de l'indicateur
 
 Clic sur l'icône dans la barre → menu avec :
+- **Statistiques** — ouvre une fenêtre avec l'historique d'activité sur 30 jours
+- **Veille (pause connexion)** — suspend les tentatives de reconnexion BLE (utile quand le tapis est rangé)
 - **Redémarrer** — reconnexion BLE propre (utile si le tapis a été mis en veille)
 - **Quitter** — arrêt complet
+
+## Fenêtre de statistiques
+
+Cliquer sur **Statistiques** dans le menu affiche une fenêtre avec :
+- Résumé : nombre de sessions, distance totale, pas totaux, durée cumulée
+- 3 graphiques sur les 30 derniers jours : distance par jour (km), pas par jour, durée par jour (minutes)
+
+Nécessite `matplotlib` installé dans le venv :
+
+```bash
+~/.local/share/walkingpad-venv/bin/pip install matplotlib
+```
+
+## Mode veille
+
+Quand le tapis est éteint, l'application tente de se reconnecter en permanence (scan BLE toutes les 5 s). Pour suspendre ces tentatives :
+
+1. Cliquer sur l'icône dans la barre
+2. Activer **Veille (pause connexion)**
+
+Le label passe à `WP: veille` et aucun scan n'est effectué. Pour reprendre, décocher l'option — le scan reprend en ~1 seconde.
+
+> Note : la veille n'interrompt pas une connexion BLE déjà active.
 
 ## Log d'activité
 
@@ -108,6 +133,12 @@ Format : une entrée JSON par ligne (JSONL), ajoutée à la déconnexion du tapi
 ```
 
 Les sessions de moins de 10 m ne sont pas enregistrées (tapis allumé sans marche).
+
+Une session se termine automatiquement si la vitesse reste à 0 pendant 60 secondes consécutives (détection d'inactivité), même si le tapis reste connecté en BLE.
+
+### Résistance aux crashes
+
+Toutes les 60 secondes, l'état courant de la session est sauvegardé dans `session_current.json`. Si l'application est tuée brutalement (`kill -9`, coupure de courant), la session est récupérée et écrite dans `activity.log` au prochain démarrage.
 
 Exemples d'exploitation :
 
