@@ -126,10 +126,12 @@ class WalkingPadIndicator:
     RECONNECT_DELAY_S    = 5.0
     SCAN_TIMEOUT_S       = 8.0
 
-    CACHE_FILE = Path.home() / ".local" / "share" / "walkingpad-indicator" / "device_address.txt"
-    LOG_FILE   = Path.home() / ".local" / "share" / "walkingpad-indicator" / "activity.log"
+    CACHE_FILE       = Path.home() / ".local" / "share" / "walkingpad-indicator" / "device_address.txt"
+    LOG_FILE         = Path.home() / ".local" / "share" / "walkingpad-indicator" / "activity.log"
+    SESSION_WIP_FILE = Path.home() / ".local" / "share" / "walkingpad-indicator" / "session_current.json"
 
-    MIN_LOG_DISTANCE_M = 10  # ignorer les sessions < 10 m (tapis allumé mais pas de marche)
+    MIN_LOG_DISTANCE_M = 10   # ignorer les sessions < 10 m (tapis allumé mais pas de marche)
+    IDLE_TIMEOUT_S     = 60   # secondes sans mouvement avant de clore la session
 
     LABEL_DISCONNECTED = "WP: --"
     LABEL_SCANNING     = "WP: scan..."
@@ -257,6 +259,7 @@ class WalkingPadIndicator:
             self.ble_loop.close()
 
     async def _ble_main(self) -> None:
+        self._recover_wip_session()
         while self._running:
             self._set_label_safe(self.LABEL_SCANNING)
 
@@ -317,8 +320,27 @@ class WalkingPadIndicator:
                 await client.start_notify(TREADMILL_DATA_UUID, on_ftms_data)
                 logging.info("Notifications FTMS activées (vitesse, distance, durée, pas).")
 
+                _loop_count  = 0
+                _last_active = datetime.datetime.now()
                 while self._running and client.is_connected:
                     await asyncio.sleep(1.0)
+                    _loop_count += 1
+
+                    if self._treadmill_data.get('speed', 0) > 0:
+                        _last_active = datetime.datetime.now()
+
+                    if _loop_count % 60 == 0:
+                        self._write_session_wip()
+
+                    # Clore la session si inactivité prolongée (tapis arrêté mais BLE connecté)
+                    idle_s = (datetime.datetime.now() - _last_active).total_seconds()
+                    if (self._session_speed_count > 0
+                            and self._treadmill_data.get('speed', 0) == 0
+                            and idle_s >= self.IDLE_TIMEOUT_S):
+                        logging.info("Inactivité %ds — session close.", int(idle_s))
+                        self._log_session()
+                        self._reset_session()
+                        _last_active = datetime.datetime.now()
 
                 await client.stop_notify(TREADMILL_DATA_UUID)
         finally:
@@ -335,7 +357,11 @@ class WalkingPadIndicator:
 
     def _log_session(self) -> None:
         """Écrit une entrée JSONL dans activity.log à la fin de chaque connexion BLE."""
-        if not self._session_start or not self._session_data_start:
+        if not self._session_start:
+            logging.info("_log_session: session_start absent, rien à enregistrer.")
+            return
+        if not self._session_data_start:
+            logging.info("_log_session: aucune notification FTMS reçue, rien à enregistrer.")
             return
 
         data_end   = self._treadmill_data
@@ -344,7 +370,12 @@ class WalkingPadIndicator:
         distance_delta = data_end.get('distance', 0) - data_start.get('distance', 0)
         steps_delta    = data_end.get('steps',    0) - data_start.get('steps',    0)
 
+        logging.info("_log_session: distance_delta=%dm  steps_delta=%d", distance_delta, steps_delta)
+
         if distance_delta < self.MIN_LOG_DISTANCE_M:
+            logging.info("_log_session: distance trop faible (%dm < %dm), session ignorée.",
+                         distance_delta, self.MIN_LOG_DISTANCE_M)
+            self.SESSION_WIP_FILE.unlink(missing_ok=True)
             return
 
         end_time   = datetime.datetime.now()
@@ -374,8 +405,88 @@ class WalkingPadIndicator:
                 distance_delta / 1000, max(0, steps_delta), avg_speed,
                 entry["start"][11:], entry["end"][11:],
             )
+            self.SESSION_WIP_FILE.unlink(missing_ok=True)
         except Exception as exc:
             logging.warning("Impossible d'écrire le log d'activité : %s", exc)
+
+    def _reset_session(self) -> None:
+        """Réinitialise les données de session sans déconnecter le BLE."""
+        self._session_start       = datetime.datetime.now()
+        self._session_data_start  = None
+        self._session_max_speed   = 0.0
+        self._session_speed_sum   = 0.0
+        self._session_speed_count = 0
+
+    def _write_session_wip(self) -> None:
+        """Checkpoint toutes les 60 s : sauvegarde l'état courant dans session_current.json."""
+        if not self._session_start or not self._session_data_start:
+            return
+        wip = {
+            "session_start": self._session_start.isoformat(),
+            "data_start":    self._session_data_start,
+            "data_current":  dict(self._treadmill_data),
+            "max_speed":     self._session_max_speed,
+            "speed_sum":     self._session_speed_sum,
+            "speed_count":   self._session_speed_count,
+            "last_update":   datetime.datetime.now().isoformat(),
+        }
+        try:
+            self.SESSION_WIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.SESSION_WIP_FILE.write_text(json.dumps(wip), encoding="utf-8")
+            logging.debug("Checkpoint session sauvegardé.")
+        except Exception as exc:
+            logging.warning("Checkpoint session impossible : %s", exc)
+
+    def _recover_wip_session(self) -> None:
+        """Au démarrage, finalise dans activity.log toute session interrompue (crash, SIGKILL)."""
+        if not self.SESSION_WIP_FILE.exists():
+            return
+        logging.info("Session précédente non terminée détectée — récupération…")
+        try:
+            wip = json.loads(self.SESSION_WIP_FILE.read_text(encoding="utf-8"))
+
+            session_start  = datetime.datetime.fromisoformat(wip["session_start"])
+            data_start     = wip["data_start"]
+            data_end       = wip["data_current"]
+            max_speed      = wip.get("max_speed", 0.0)
+            speed_sum      = wip.get("speed_sum", 0.0)
+            speed_count    = wip.get("speed_count", 0)
+
+            distance_delta = data_end.get('distance', 0) - data_start.get('distance', 0)
+            steps_delta    = data_end.get('steps',    0) - data_start.get('steps',    0)
+
+            if distance_delta < self.MIN_LOG_DISTANCE_M:
+                logging.info("Session récupérée trop courte (%dm), ignorée.", distance_delta)
+                self.SESSION_WIP_FILE.unlink(missing_ok=True)
+                return
+
+            end_time   = datetime.datetime.fromisoformat(wip.get("last_update", datetime.datetime.now().isoformat()))
+            duration_s = int((end_time - session_start).total_seconds())
+            avg_speed  = round(speed_sum / speed_count, 2) if speed_count else 0.0
+
+            entry = {
+                "date":          session_start.strftime("%Y-%m-%d"),
+                "start":         session_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                "end":           end_time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "duration_s":    duration_s,
+                "distance_m":    max(0, distance_delta),
+                "steps":         max(0, steps_delta),
+                "max_speed_kmh": round(max_speed, 1),
+                "avg_speed_kmh": avg_speed,
+                "recovered":     True,
+            }
+
+            self.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with self.LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+            logging.info(
+                "Session récupérée et enregistrée : %.2fkm  %d stp  [%s → %s]",
+                distance_delta / 1000, max(0, steps_delta),
+                entry["start"][11:], entry["end"][11:],
+            )
+            self.SESSION_WIP_FILE.unlink(missing_ok=True)
+        except Exception as exc:
+            logging.warning("Récupération session WIP échouée : %s", exc)
 
     # ------------------------------------------------------------------
     # Scan / cache
