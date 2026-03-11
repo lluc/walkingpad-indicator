@@ -135,6 +135,7 @@ class WalkingPadIndicator:
 
     LABEL_DISCONNECTED = "WP: --"
     LABEL_SCANNING     = "WP: scan..."
+    LABEL_PAUSED       = "WP: veille"
     LABEL_GUIDE        = "WP: 9.9km/h  9.99km  9:99:99  9999stp"
 
     def __init__(self, debug: bool = False):
@@ -163,6 +164,7 @@ class WalkingPadIndicator:
         self._running   = True
         self._connected = False
         self._restart   = False  # True → relancer après arrêt propre
+        self._paused    = False  # True → pas de scan/reconnexion BLE
 
         # --- fenêtre de statistiques (thread GTK uniquement) ---
         self._stats_window: Optional[Gtk.Window] = None
@@ -185,6 +187,10 @@ class WalkingPadIndicator:
         item_stats = Gtk.MenuItem(label="Statistiques")
         item_stats.connect("activate", self._on_show_stats)
         self.menu.append(item_stats)
+
+        self._item_pause = Gtk.CheckMenuItem(label="Veille (pause connexion)")
+        self._item_pause.connect("toggled", self._on_toggle_pause)
+        self.menu.append(self._item_pause)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -225,6 +231,14 @@ class WalkingPadIndicator:
         logging.info("Redémarrage demandé…")
         self._restart = True
         self._on_quit()
+
+    def _on_toggle_pause(self, item: Gtk.CheckMenuItem) -> None:
+        self._paused = item.get_active()
+        if self._paused and not self._connected:
+            self._set_label_safe(self.LABEL_PAUSED)
+        elif not self._paused and not self._connected:
+            self._set_label_safe(self.LABEL_DISCONNECTED)
+        logging.info("Veille %s.", "activée" if self._paused else "désactivée")
 
     def _on_quit(self, _source=None) -> None:
         logging.info("Arrêt demandé.")
@@ -378,6 +392,10 @@ class WalkingPadIndicator:
     async def _ble_main(self) -> None:
         self._recover_wip_session()
         while self._running:
+            if self._paused:
+                self._set_label_safe(self.LABEL_PAUSED)
+                await asyncio.sleep(1.0)
+                continue
             self._set_label_safe(self.LABEL_SCANNING)
 
             address = self._load_cached_address()
