@@ -164,6 +164,9 @@ class WalkingPadIndicator:
         self._connected = False
         self._restart   = False  # True → relancer après arrêt propre
 
+        # --- fenêtre de statistiques (thread GTK uniquement) ---
+        self._stats_window: Optional[Gtk.Window] = None
+
     # ------------------------------------------------------------------
     # Thread principal — GTK
     # ------------------------------------------------------------------
@@ -178,6 +181,12 @@ class WalkingPadIndicator:
         self.indicator.set_label(self.LABEL_DISCONNECTED, self.LABEL_GUIDE)
 
         self.menu = Gtk.Menu()
+
+        item_stats = Gtk.MenuItem(label="Statistiques")
+        item_stats.connect("activate", self._on_show_stats)
+        self.menu.append(item_stats)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
 
         item_restart = Gtk.MenuItem(label="Redémarrer")
         item_restart.connect("activate", self._on_restart)
@@ -224,6 +233,114 @@ class WalkingPadIndicator:
             asyncio.run_coroutine_threadsafe(self._ble_shutdown(), self.ble_loop)
         if self.main_loop:
             self.main_loop.quit()
+
+    def _load_sessions(self) -> list:
+        """Lit activity.log et retourne la liste des sessions valides."""
+        sessions = []
+        if not self.LOG_FILE.exists():
+            return sessions
+        try:
+            for line in self.LOG_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        sessions.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as exc:
+            logging.warning("Lecture activity.log : %s", exc)
+        return sessions
+
+    def _on_show_stats(self, _source=None) -> None:
+        """Ouvre (ou met au premier plan) la fenêtre de statistiques."""
+        if self._stats_window and self._stats_window.get_visible():
+            self._stats_window.present()
+            return
+
+        import matplotlib
+        matplotlib.use('GTK3Agg')
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_gtk3agg import FigureCanvasGTK3Agg as FigureCanvas
+
+        sessions = self._load_sessions()
+
+        win = Gtk.Window(title="WalkingPad — Statistiques (30 derniers jours)")
+        win.set_default_size(860, 700)
+        win.connect("destroy", lambda w: setattr(self, '_stats_window', None))
+        self._stats_window = win
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.set_margin_top(8)
+        vbox.set_margin_bottom(8)
+        vbox.set_margin_start(8)
+        vbox.set_margin_end(8)
+        win.add(vbox)
+
+        if not sessions:
+            label = Gtk.Label(label="Aucune session enregistrée pour l'instant.")
+            vbox.pack_start(label, True, True, 0)
+            win.show_all()
+            return
+
+        # Filtrer les 30 derniers jours
+        today      = datetime.date.today()
+        cutoff     = today - datetime.timedelta(days=29)
+        recent     = [s for s in sessions if s.get('date', '') >= str(cutoff)]
+        all_days   = sorted({s['date'] for s in recent})
+
+        # Agréger par jour
+        daily_dist = {d: 0.0 for d in all_days}
+        daily_stp  = {d: 0   for d in all_days}
+        daily_dur  = {d: 0.0 for d in all_days}
+        for s in recent:
+            d = s['date']
+            daily_dist[d] += s.get('distance_m', 0) / 1000.0
+            daily_stp[d]  += s.get('steps', 0)
+            daily_dur[d]  += s.get('duration_s', 0) / 60.0
+
+        x      = list(range(len(all_days)))
+        labels = [datetime.date.fromisoformat(d).strftime('%d/%m') for d in all_days]
+
+        # Résumé texte
+        tot_km  = sum(s.get('distance_m', 0) for s in sessions) / 1000.0
+        tot_stp = sum(s.get('steps', 0)      for s in sessions)
+        tot_s   = sum(s.get('duration_s', 0) for s in sessions)
+        tot_h, tot_m = divmod(tot_s // 60, 60)
+        summary = (f"{len(sessions)} sessions  ·  {tot_km:.1f} km total  ·  "
+                   f"{tot_stp:,} pas  ·  {int(tot_h)}h{int(tot_m):02d}min")
+        lbl = Gtk.Label(label=summary)
+        lbl.set_halign(Gtk.Align.START)
+        vbox.pack_start(lbl, False, False, 0)
+
+        # Figure matplotlib
+        fig = Figure(figsize=(9, 7), tight_layout=True)
+        color = '#4c9be8'
+
+        ax1 = fig.add_subplot(3, 1, 1)
+        ax1.bar(x, [daily_dist[d] for d in all_days], color=color)
+        ax1.set_ylabel('km')
+        ax1.set_title('Distance par jour')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels([])
+
+        ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
+        ax2.bar(x, [daily_stp[d] for d in all_days], color='#6cc86c')
+        ax2.set_ylabel('pas')
+        ax2.set_title('Pas par jour')
+        ax2.set_xticklabels([])
+
+        ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
+        ax3.bar(x, [daily_dur[d] for d in all_days], color='#e88c4c')
+        ax3.set_ylabel('min')
+        ax3.set_title('Durée par jour')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+        canvas = FigureCanvas(fig)
+        canvas.set_size_request(840, 600)
+        vbox.pack_start(canvas, True, True, 0)
+
+        win.show_all()
 
     def run(self) -> None:
         self._build_indicator()
