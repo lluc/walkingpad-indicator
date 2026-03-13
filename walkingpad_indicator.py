@@ -25,7 +25,7 @@ import bleak
 import gi
 gi.require_version('AyatanaAppIndicator3', '0.1')
 gi.require_version('Gtk', '3.0')
-from gi.repository import AyatanaAppIndicator3, GLib, Gtk
+from gi.repository import AyatanaAppIndicator3, Gdk, GLib, Gtk
 
 # UUID FTMS Treadmill Data (standard Bluetooth)
 TREADMILL_DATA_UUID = "00002acd-0000-1000-8000-00805f9b34fb"
@@ -166,8 +166,9 @@ class WalkingPadIndicator:
         self._restart   = False  # True → relancer après arrêt propre
         self._paused    = False  # True → pas de scan/reconnexion BLE
 
-        # --- fenêtre de statistiques (thread GTK uniquement) ---
+        # --- fenêtres de statistiques (thread GTK uniquement) ---
         self._stats_window: Optional[Gtk.Window] = None
+        self._detail_window: Optional[Gtk.Window] = None
 
     # ------------------------------------------------------------------
     # Thread principal — GTK
@@ -338,7 +339,7 @@ class WalkingPadIndicator:
         ax1.set_xticklabels([])
 
         ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
-        ax2.bar(x, [daily_stp[d] for d in all_days], color='#6cc86c')
+        bars2 = ax2.bar(x, [daily_stp[d] for d in all_days], color='#6cc86c', picker=True)
         ax2.set_ylabel('pas')
         ax2.set_title('Pas par jour')
         ax2.set_xticklabels([])
@@ -354,6 +355,108 @@ class WalkingPadIndicator:
         canvas.set_size_request(840, 600)
         vbox.pack_start(canvas, True, True, 0)
 
+        # Clic sur une barre de pas → détail horaire
+        def _on_pick(event):
+            if event.artist.axes is not ax2:
+                return
+            for bar in bars2:
+                bar.set_facecolor('#6cc86c')
+            event.artist.set_facecolor('#3a7a3a')
+            fig.canvas.draw_idle()
+            idx = list(bars2).index(event.artist)
+            self._open_hourly_detail(all_days[idx], sessions)
+
+        fig.canvas.mpl_connect('pick_event', _on_pick)
+
+        # Curseur pointer au survol de ax2
+        def _on_motion(event):
+            gdk_win = canvas.get_window()
+            if gdk_win is None:
+                return
+            if event.inaxes is ax2:
+                gdk_win.set_cursor(Gdk.Cursor.new_from_name(canvas.get_display(), 'pointer'))
+            else:
+                gdk_win.set_cursor(None)
+
+        fig.canvas.mpl_connect('motion_notify_event', _on_motion)
+
+        win.show_all()
+
+    def _compute_hourly_steps(self, day_str: str, sessions: list) -> dict:
+        """Retourne un dict {heure: pas} pour le jour day_str.
+
+        Les pas d'une session sont distribués proportionnellement au temps
+        passé dans chaque tranche horaire.
+        """
+        hourly: dict = {h: 0 for h in range(24)}
+        for s in sessions:
+            if s.get('date', '') != day_str:
+                continue
+            steps = s.get('steps', 0)
+            if steps == 0:
+                continue
+            total_s = s.get('duration_s', 0)
+            try:
+                start = datetime.datetime.fromisoformat(s['start'])
+                end   = datetime.datetime.fromisoformat(s['end'])
+            except (KeyError, ValueError):
+                continue
+            if total_s <= 0:
+                hourly[start.hour] += steps
+                continue
+            current = start
+            while current < end:
+                next_hour = (current.replace(minute=0, second=0, microsecond=0)
+                             + datetime.timedelta(hours=1))
+                slice_end = min(next_hour, end)
+                slice_s   = (slice_end - current).total_seconds()
+                hourly[current.hour] += round(steps * slice_s / total_s)
+                current = slice_end
+        return hourly
+
+    def _open_hourly_detail(self, day_str: str, sessions: list) -> None:
+        """Ouvre une fenêtre affichant les pas par heure pour un jour donné."""
+        if self._detail_window and self._detail_window.get_realized():
+            self._detail_window.destroy()
+
+        import matplotlib
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_gtk3agg import FigureCanvasGTK3Agg as FigureCanvas
+
+        hourly    = self._compute_hourly_steps(day_str, sessions)
+        hours     = list(range(24))
+        step_vals = [hourly[h] for h in hours]
+        labels    = [f"{h:02d}h" for h in hours]
+
+        win = Gtk.Window(title=f"WalkingPad — Pas par heure · {day_str}")
+        win.set_default_size(640, 400)
+        win.connect("destroy", lambda w: setattr(self, '_detail_window', None))
+        self._detail_window = win
+
+        fig = Figure(figsize=(7, 4), tight_layout=True)
+        ax  = fig.add_subplot(1, 1, 1)
+        ax.bar(hours, step_vals, color='#6cc86c')
+        for h, v in zip(hours, step_vals):
+            if v > 0:
+                ax.text(h, v, str(v), ha='center', va='bottom', fontsize=8)
+        ax.set_xticks(hours)
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        ax.set_ylabel('Pas')
+        ax.set_title(f'Pas par heure — {day_str}')
+        active = [h for h in hours if step_vals[h] > 0]
+        if active:
+            ax.set_xlim(active[0] - 0.7, active[-1] + 0.7)
+
+        canvas = FigureCanvas(fig)
+        canvas.set_size_request(620, 340)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vbox.set_margin_top(8)
+        vbox.set_margin_bottom(8)
+        vbox.set_margin_start(8)
+        vbox.set_margin_end(8)
+        vbox.pack_start(canvas, True, True, 0)
+        win.add(vbox)
         win.show_all()
 
     def run(self) -> None:
