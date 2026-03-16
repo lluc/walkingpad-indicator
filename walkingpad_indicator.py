@@ -111,6 +111,321 @@ def parse_treadmill_data(data: bytearray) -> Optional[dict]:
     return result
 
 
+class HikingVideoWindow:
+    """
+    Fenêtre plein écran jouant une vidéo de randonnée avec les données du tapis
+    superposées en haut. La vitesse de lecture s'adapte à la vitesse du tapis
+    (référence : REFERENCE_SPEED_KMH km/h → taux 1.0).
+
+    Créée et utilisée exclusivement depuis le thread GTK principal.
+    GStreamer (playbin + gtksink) est importé en lazy au premier usage.
+    """
+
+    REFERENCE_SPEED_KMH = 2.0
+
+    def __init__(self, video_path: str, on_close_cb) -> None:
+        gi.require_version('Gst', '1.0')
+        from gi.repository import Gst
+        self._Gst = Gst
+        Gst.init(None)
+
+        self._on_close_cb = on_close_cb
+        self._current_rate = 1.0   # 0.0 = en pause par le tapis
+        self._is_fullscreen = False
+
+        # Pipeline GStreamer
+        self._pipeline = Gst.ElementFactory.make("playbin", "playbin")
+        gtksink = Gst.ElementFactory.make("gtksink", "gtksink")
+        if not self._pipeline or not gtksink:
+            raise RuntimeError("GStreamer playbin ou gtksink non disponible.")
+        self._pipeline.set_property("video-sink", gtksink)
+        self._pipeline.set_property("uri", Gst.filename_to_uri(video_path))
+
+        # Fenêtre GTK (non plein écran au départ — déplacer puis F11)
+        self._window = Gtk.Window()
+        self._window.set_title(f"Randonnée — {Path(video_path).stem}  [F11 = plein écran · Échap = fermer]")
+        self._window.set_default_size(1280, 720)
+        self._window.connect("key-press-event", self._on_key_press)
+        self._window.connect("destroy", self._on_destroy)
+
+        # Overlay : widget vidéo en fond, barre d'info en haut
+        overlay_container = Gtk.Overlay()
+
+        video_widget = gtksink.props.widget
+        video_widget.set_hexpand(True)
+        video_widget.set_vexpand(True)
+        overlay_container.add(video_widget)
+
+        self._info_label = Gtk.Label(label="WalkingPad…")
+        self._info_label.set_halign(Gtk.Align.CENTER)
+        self._info_label.set_valign(Gtk.Align.START)
+        css = b"""
+            label {
+                background-color: rgba(0, 0, 0, 0.65);
+                color: white;
+                font-size: 18px;
+                font-family: monospace;
+                padding: 8px 16px;
+            }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        self._info_label.get_style_context().add_provider(
+            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        overlay_container.add_overlay(self._info_label)
+
+        # Bouton plein écran (coin supérieur droit)
+        self._fs_button = Gtk.Button()
+        self._fs_button.set_image(
+            Gtk.Image.new_from_icon_name("view-fullscreen", Gtk.IconSize.LARGE_TOOLBAR)
+        )
+        self._fs_button.set_halign(Gtk.Align.END)
+        self._fs_button.set_valign(Gtk.Align.START)
+        self._fs_button.set_tooltip_text("Plein écran (F11)")
+        self._fs_button.connect("clicked", lambda _: self._toggle_fullscreen())
+        btn_css = b"""
+            button {
+                background-color: rgba(0, 0, 0, 0.55);
+                border: none;
+                border-radius: 4px;
+                padding: 4px;
+                margin: 6px;
+            }
+            button:hover {
+                background-color: rgba(0, 0, 0, 0.85);
+            }
+            button image {
+                color: white;
+            }
+        """
+        btn_provider = Gtk.CssProvider()
+        btn_provider.load_from_data(btn_css)
+        self._fs_button.get_style_context().add_provider(
+            btn_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        overlay_container.add_overlay(self._fs_button)
+
+        # Jauge temporelle discrète en bas
+        self._progress_bar = Gtk.ProgressBar()
+        self._progress_bar.set_halign(Gtk.Align.FILL)
+        self._progress_bar.set_valign(Gtk.Align.END)
+        self._progress_bar.set_fraction(0.0)
+        pb_css = b"""
+            progressbar trough {
+                background-color: rgba(255, 255, 255, 0.15);
+                min-height: 4px;
+                border-radius: 0;
+            }
+            progressbar progress {
+                background-color: rgba(255, 255, 255, 0.65);
+                min-height: 4px;
+                border-radius: 0;
+            }
+            progressbar {
+                padding: 0;
+                margin: 0;
+            }
+        """
+        pb_provider = Gtk.CssProvider()
+        pb_provider.load_from_data(pb_css)
+        self._progress_bar.get_style_context().add_provider(
+            pb_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        overlay_container.add_overlay(self._progress_bar)
+
+        # Label de temps affiché brièvement lors des sauts temporels
+        self._seek_label = Gtk.Label(label="")
+        self._seek_label.set_halign(Gtk.Align.START)
+        self._seek_label.set_valign(Gtk.Align.END)
+        self._seek_label.set_no_show_all(True)
+        sk_css = b"""
+            label {
+                background-color: rgba(0, 0, 0, 0.70);
+                color: white;
+                font-size: 13px;
+                font-family: monospace;
+                padding: 3px 8px;
+                border-radius: 4px;
+                margin-bottom: 10px;
+            }
+        """
+        sk_provider = Gtk.CssProvider()
+        sk_provider.load_from_data(sk_css)
+        self._seek_label.get_style_context().add_provider(
+            sk_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        overlay_container.add_overlay(self._seek_label)
+        self._seek_hide_timer = None
+
+        self._window.add(overlay_container)
+        self._window.show_all()
+
+        self._progress_timer = GLib.timeout_add(500, self._update_progress)
+
+        # Bus GStreamer : loop sur EOS, log des erreurs
+        bus = self._pipeline.get_bus()
+        bus.add_watch(GLib.PRIORITY_DEFAULT, self._on_bus_message)
+
+        self._pipeline.set_state(Gst.State.PLAYING)
+
+    def update_treadmill_info(self, data: dict) -> None:
+        """Met à jour l'overlay et adapte la vitesse de lecture. Thread GTK uniquement."""
+        speed    = data.get('speed', 0.0)
+        distance = data.get('distance', 0) / 1000.0
+        elapsed  = int(data.get('time', 0))
+        steps    = data.get('steps', 0)
+
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        s = elapsed % 60
+        time_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        self._info_label.set_text(
+            f"  {speed:.1f} km/h   {distance:.2f} km   {time_str}   {steps} pas  "
+        )
+
+        if speed == 0.0:
+            if self._current_rate != 0.0:
+                self._pipeline.set_state(self._Gst.State.PAUSED)
+                self._current_rate = 0.0
+        else:
+            new_rate = speed / self.REFERENCE_SPEED_KMH
+            if abs(new_rate - self._current_rate) > 0.05:
+                if self._current_rate == 0.0:
+                    self._pipeline.set_state(self._Gst.State.PLAYING)
+                self._set_playback_rate(new_rate)
+                self._current_rate = new_rate
+
+    def _set_playback_rate(self, rate: float) -> None:
+        Gst = self._Gst
+        ok, pos = self._pipeline.query_position(Gst.Format.TIME)
+        if not ok:
+            pos = 0
+        self._pipeline.seek(
+            rate,
+            Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+            Gst.SeekType.SET, pos,
+            Gst.SeekType.NONE, 0,
+        )
+
+    def _on_bus_message(self, bus, message) -> bool:
+        Gst = self._Gst
+        if message.type == Gst.MessageType.EOS:
+            # Boucle : retour au début
+            self._pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0)
+        elif message.type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            logging.warning("GStreamer erreur : %s — %s", err, debug)
+        return True
+
+    def _update_progress(self) -> bool:
+        """Rafraîchit la jauge temporelle toutes les 500 ms. Retourne True pour se répéter."""
+        Gst = self._Gst
+        ok_pos, pos = self._pipeline.query_position(Gst.Format.TIME)
+        ok_dur, dur = self._pipeline.query_duration(Gst.Format.TIME)
+        if ok_pos and ok_dur and dur > 0:
+            self._progress_bar.set_fraction(min(1.0, pos / dur))
+        return True
+
+    def _seek_relative(self, offset_s: int) -> None:
+        """Saute de offset_s secondes (positif = avance, négatif = recule)."""
+        Gst = self._Gst
+        ok_pos, pos = self._pipeline.query_position(Gst.Format.TIME)
+        ok_dur, dur = self._pipeline.query_duration(Gst.Format.TIME)
+        if not ok_pos:
+            return
+        new_pos = pos + offset_s * Gst.SECOND
+        new_pos = max(0, new_pos)
+        if ok_dur and dur > 0:
+            new_pos = min(new_pos, dur)
+        self._pipeline.seek(
+            self._current_rate if self._current_rate != 0.0 else 1.0,
+            Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+            Gst.SeekType.SET, new_pos,
+            Gst.SeekType.NONE, 0,
+        )
+        fraction = new_pos / dur if (ok_dur and dur > 0) else 0.0
+        self._show_seek_time(new_pos, fraction)
+
+    def _show_seek_time(self, pos_ns: int, fraction: float) -> None:
+        """Affiche brièvement le temps courant au-dessus du curseur de la jauge."""
+        Gst = self._Gst
+        total_s = pos_ns // Gst.SECOND
+        h = total_s // 3600
+        m = (total_s % 3600) // 60
+        s = total_s % 60
+        time_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        self._seek_label.set_text(time_str)
+
+        # Positionner le label horizontalement au-dessus du curseur
+        win_width = self._window.get_allocated_width()
+        lbl_width, _ = self._seek_label.get_preferred_width()
+        x = int(fraction * win_width) - lbl_width // 2
+        x = max(0, min(win_width - lbl_width, x))
+        self._seek_label.set_margin_start(x)
+
+        self._seek_label.show()
+
+        # Annuler le timer précédent et en lancer un nouveau
+        if self._seek_hide_timer:
+            GLib.source_remove(self._seek_hide_timer)
+        self._seek_hide_timer = GLib.timeout_add(2000, self._hide_seek_time)
+
+    def _hide_seek_time(self) -> bool:
+        self._seek_label.hide()
+        self._seek_hide_timer = None
+        return False
+
+    def _toggle_fullscreen(self) -> None:
+        if self._is_fullscreen:
+            self._window.unfullscreen()
+            self._is_fullscreen = False
+            self._fs_button.set_image(
+                Gtk.Image.new_from_icon_name("view-fullscreen", Gtk.IconSize.LARGE_TOOLBAR)
+            )
+            self._fs_button.set_tooltip_text("Plein écran (F11)")
+        else:
+            self._window.fullscreen()
+            self._is_fullscreen = True
+            self._fs_button.set_image(
+                Gtk.Image.new_from_icon_name("view-restore", Gtk.IconSize.LARGE_TOOLBAR)
+            )
+            self._fs_button.set_tooltip_text("Quitter le plein écran (F11)")
+
+    def _on_key_press(self, widget, event) -> bool:
+        kv = event.keyval
+        if kv == Gdk.KEY_Escape:
+            self.close()
+        elif kv in (Gdk.KEY_f, Gdk.KEY_F11):
+            self._toggle_fullscreen()
+        elif kv == Gdk.KEY_Right:
+            self._seek_relative(+10)
+        elif kv == Gdk.KEY_Left:
+            self._seek_relative(-10)
+        elif kv == Gdk.KEY_Up:
+            self._seek_relative(+30)
+        elif kv == Gdk.KEY_Down:
+            self._seek_relative(-30)
+        return True
+
+    def _on_destroy(self, widget) -> None:
+        if self._progress_timer:
+            GLib.source_remove(self._progress_timer)
+            self._progress_timer = None
+        if self._seek_hide_timer:
+            GLib.source_remove(self._seek_hide_timer)
+            self._seek_hide_timer = None
+        self._pipeline.set_state(self._Gst.State.NULL)
+        if self._on_close_cb:
+            cb = self._on_close_cb
+            self._on_close_cb = None
+            cb()
+
+    def close(self) -> None:
+        self._window.destroy()
+
 
 class WalkingPadIndicator:
     """
@@ -169,6 +484,7 @@ class WalkingPadIndicator:
         # --- fenêtres de statistiques (thread GTK uniquement) ---
         self._stats_window: Optional[Gtk.Window] = None
         self._detail_window: Optional[Gtk.Window] = None
+        self._hiking_window: Optional[HikingVideoWindow] = None
 
     # ------------------------------------------------------------------
     # Thread principal — GTK
@@ -188,6 +504,10 @@ class WalkingPadIndicator:
         item_stats = Gtk.MenuItem(label="Statistiques")
         item_stats.connect("activate", self._on_show_stats)
         self.menu.append(item_stats)
+
+        item_hiking = Gtk.MenuItem(label="Randonnée")
+        item_hiking.connect("activate", self._on_show_hiking_videos)
+        self.menu.append(item_hiking)
 
         self._item_pause = Gtk.CheckMenuItem(label="Veille (pause connexion)")
         self._item_pause.connect("toggled", self._on_toggle_pause)
@@ -222,6 +542,8 @@ class WalkingPadIndicator:
 
         label = f"{speed:.1f}km/h  {distance:.2f}km  {h}:{m:02d}:{s:02d}  {steps}stp"
         self.indicator.set_label(label, self.LABEL_GUIDE)
+        if self._hiking_window:
+            self._hiking_window.update_treadmill_info(self._treadmill_data)
         return False
 
     def _set_label_safe(self, label: str) -> None:
@@ -458,6 +780,91 @@ class WalkingPadIndicator:
         vbox.pack_start(canvas, True, True, 0)
         win.add(vbox)
         win.show_all()
+
+    def _on_show_hiking_videos(self, _source=None) -> None:
+        """Ouvre un dialogue de sélection de vidéo, puis lance la lecture plein écran."""
+        videos_dir = Path.home() / "Vidéos" / "hiking"
+        if not videos_dir.is_dir():
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Dossier introuvable :\n{videos_dir}",
+            )
+            dlg.run()
+            dlg.destroy()
+            return
+
+        exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+        files = sorted(f for f in videos_dir.iterdir() if f.is_file() and f.suffix.lower() in exts)
+
+        if not files:
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Aucune vidéo dans :\n{videos_dir}",
+            )
+            dlg.run()
+            dlg.destroy()
+            return
+
+        # Un seul fichier → lancer directement
+        if len(files) == 1:
+            self._launch_hiking_video(str(files[0]))
+            return
+
+        # Dialogue de sélection
+        selected = [None]
+
+        dlg = Gtk.Dialog(title="Choisir une vidéo de randonnée")
+        dlg.set_default_size(640, 420)
+        dlg.add_button("Annuler", Gtk.ResponseType.CANCEL)
+
+        liststore = Gtk.ListStore(str, str)
+        for f in files:
+            liststore.append([f.name, str(f)])
+
+        treeview = Gtk.TreeView(model=liststore)
+        col = Gtk.TreeViewColumn("Vidéo", Gtk.CellRendererText(), text=0)
+        treeview.append_column(col)
+
+        def on_row_activated(_tv, path, _col):
+            selected[0] = liststore[path][1]
+            dlg.response(Gtk.ResponseType.OK)
+
+        treeview.connect("row-activated", on_row_activated)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.add(treeview)
+        dlg.get_content_area().pack_start(scrolled, True, True, 0)
+        dlg.show_all()
+
+        response = dlg.run()
+        video_path = selected[0]
+        dlg.destroy()
+
+        if response == Gtk.ResponseType.OK and video_path:
+            self._launch_hiking_video(video_path)
+
+    def _launch_hiking_video(self, video_path: str) -> None:
+        """Ferme l'éventuelle fenêtre existante et lance la nouvelle vidéo."""
+        if self._hiking_window:
+            self._hiking_window.close()
+        try:
+            self._hiking_window = HikingVideoWindow(
+                video_path,
+                on_close_cb=lambda: setattr(self, '_hiking_window', None),
+            )
+        except Exception as exc:
+            logging.error("Impossible de lancer la vidéo : %s", exc)
+            self._hiking_window = None
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Erreur de lecture vidéo :\n{exc}",
+            )
+            dlg.run()
+            dlg.destroy()
 
     def run(self) -> None:
         self._build_indicator()
