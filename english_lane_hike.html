@@ -6,7 +6,7 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#000;overflow:hidden;width:100vw;height:100vh}
-canvas{width:100%;height:100%;display:block}
+canvas{width:100%;height:100%;display:block;will-change:transform;transform:translateZ(0)}
 #hud{position:fixed;top:0;left:0;right:0;background:rgba(8,10,14,.74);padding:5px 16px;display:flex;gap:24px;z-index:10;opacity:0;transition:opacity .6s}
 #hud span{color:#fff;font:13px/1.8 monospace}
 #bar{position:fixed;bottom:10px;left:10px;right:10px;display:flex;align-items:center;gap:10px;background:rgba(0,0,0,.66);border-radius:7px;padding:7px 14px;z-index:10}
@@ -669,7 +669,7 @@ in vec2 vUV;
 out vec4 fragColor;
 void main(){ fragColor=texture(uTex,vUV); }`;
 
-const gl = canvas.getContext('webgl2');
+const gl = canvas.getContext('webgl2', { antialias: false, powerPreference: 'high-performance', preserveDrawingBuffer: false });
 if (!gl) {
   document.getElementById('loading').textContent = 'WebGL2 non supporté';
   throw 'no webgl2';
@@ -750,6 +750,16 @@ window.updateTreadmill = function(speedKmh, distM, steps, elapsedS) {
   _treadmill_steps = steps;
 };
 
+// Polling HTTP quand servi via Chromium (http://)
+if (location.protocol === 'http:' || location.protocol === 'https:') {
+  setInterval(() => {
+    fetch('/api/treadmill?t=' + Date.now())
+      .then(r => r.json())
+      .then(d => window.updateTreadmill(d.speed, d.dist, d.steps, d.elapsed))
+      .catch(() => {});
+  }, 500);
+}
+
 canvas.addEventListener('mousemove', e => { mx = e.clientX; my = canvas.clientHeight - e.clientY; });
 canvas.addEventListener('mousedown', e => { mb = 1; mx = e.clientX; my = canvas.clientHeight - e.clientY; });
 canvas.addEventListener('mouseup', () => mb = 0);
@@ -795,8 +805,7 @@ function fmtTime(s) {
 }
 
 function render(ts) {
-  requestAnimationFrame(render);
-  if (!prog || !blitProg) return;
+  if (!prog || !blitProg) { requestAnimationFrame(render); return; }
   if (!lastT) lastT = ts;
   const delta = Math.min((ts - lastT) / 1000, 0.05);
   lastT = ts;
@@ -844,12 +853,14 @@ function render(ts) {
   gl.bindVertexArray(vao);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.bindVertexArray(null);
+  gl.finish();
 
   // HUD
   document.getElementById('h1').textContent = speed.toFixed(1) + ' km/h';
   document.getElementById('h2').textContent = (dist/1000).toFixed(2) + ' km';
   document.getElementById('h3').textContent = fmtTime(elapsed);
   document.getElementById('h4').textContent = (_treadmill_connected ? _treadmill_steps : Math.round(dist/0.76)) + ' pas';
+  requestAnimationFrame(render);
 }
 
 requestAnimationFrame(render);

@@ -12,10 +12,13 @@ Usage:
 
 import asyncio
 import datetime
+import http.server
 import json
 import logging
 import os
 import signal
+import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -429,89 +432,101 @@ class HikingVideoWindow:
 
 class HikingSimWindow:
     """
-    Fenêtre de simulation 3D d'une randonnée en campagne anglaise.
-    Utilise WebKit2GTK (webkit2-4.1) pour exécuter le shader WebGL2 custom.
-    La caméra avance proportionnellement à la distance parcourue sur le tapis.
+    Fenêtre de simulation 3D via Chromium en mode --app.
+    Remplace WebKit2GTK pour éviter le tearing diagonal (back-slash) causé
+    par le pipeline DMA-buf asynchrone de WebKit2GTK/Wayland.
 
-    Créée et utilisée exclusivement depuis le thread GTK principal.
-    WebKit2 est importé en lazy au premier usage.
+    Un mini serveur HTTP sert l'HTML et expose /api/treadmill (JSON).
+    Chromium est lancé en subprocess, la fenêtre est gérée par Chromium.
     """
 
     HTML_PATH = Path(__file__).parent / "english_lane_hike.html"
 
     def __init__(self, on_close_cb) -> None:
-        gi.require_version('WebKit2', '4.1')
-        from gi.repository import WebKit2
-
-        self._WebKit2     = WebKit2
         self._on_close_cb = on_close_cb
-        self._is_fullscreen = False
-        self._loaded      = False
+        self._proc        = None
+        self._http_server = None
+        self._api_data    = {'speed': 0.0, 'dist': 0, 'steps': 0, 'elapsed': 0}
+        self._api_lock    = threading.Lock()
 
-        settings = WebKit2.Settings()
-        settings.set_enable_webgl(True)
-        settings.set_hardware_acceleration_policy(
-            WebKit2.HardwareAccelerationPolicy.ALWAYS
+        port = self._start_http_server()
+        url  = f'http://localhost:{port}/english_lane_hike.html'
+        self._proc = subprocess.Popen(
+            [
+                'chromium',
+                f'--app={url}',
+                '--window-size=1280,720',
+                '--no-default-browser-check',
+                '--no-first-run',
+                '--disable-infobars',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        settings.set_enable_javascript(True)
-        settings.set_allow_file_access_from_file_urls(True)
-        settings.set_allow_universal_access_from_file_urls(True)
+        # Surveiller la fermeture de Chromium pour déclencher le callback
+        GLib.timeout_add(1000, self._check_process)
 
-        self._webview = WebKit2.WebView()
-        self._webview.set_settings(settings)
-        self._webview.connect("load-changed", self._on_load_changed)
+    def _start_http_server(self) -> int:
+        """Démarre un serveur HTTP dans un thread daemon, retourne le port."""
+        with socket.socket() as s:
+            s.bind(('localhost', 0))
+            port = s.getsockname()[1]
 
-        self._window = Gtk.Window()
-        self._window.set_title(
-            "Simulation 3D — Randonnée en campagne  [F11 plein écran · Échap fermer]"
-        )
-        self._window.set_default_size(1280, 720)
-        self._window.connect("key-press-event", self._on_key_press)
-        self._window.connect("destroy", self._on_destroy)
-        self._window.add(self._webview)
-        self._webview.load_uri(self.HTML_PATH.as_uri())
-        self._window.show_all()
+        html_dir = str(self.HTML_PATH.parent)
+        api_data = self._api_data
+        api_lock = self._api_lock
+
+        class _Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=html_dir, **kwargs)
+
+            def do_GET(self):
+                if self.path.startswith('/api/treadmill'):
+                    with api_lock:
+                        body = json.dumps(api_data).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    super().do_GET()
+
+            def log_message(self, *args):
+                pass  # pas de logs HTTP dans la console
+
+        self._http_server = http.server.HTTPServer(('localhost', port), _Handler)
+        t = threading.Thread(target=self._http_server.serve_forever, daemon=True)
+        t.start()
+        return port
 
     def update_treadmill_info(self, data: dict) -> None:
-        """Push vitesse + distance vers le JS. Appelé depuis le thread GTK uniquement."""
-        if not self._loaded:
-            return
-        speed = data.get('speed', 0.0)
-        dist  = data.get('distance', 0)
-        steps = data.get('steps', 0)
-        time  = data.get('time', 0)
-        js = f"window.updateTreadmill({speed:.2f}, {dist}, {steps}, {time});"
-        self._webview.run_javascript(js, None, None, None)
+        """Met à jour les données tapis exposées via /api/treadmill."""
+        with self._api_lock:
+            self._api_data['speed']   = data.get('speed', 0.0)
+            self._api_data['dist']    = data.get('distance', 0)
+            self._api_data['steps']   = data.get('steps', 0)
+            self._api_data['elapsed'] = data.get('time', 0)
 
-    def _on_load_changed(self, webview, load_event) -> None:
-        if load_event == self._WebKit2.LoadEvent.FINISHED:
-            self._loaded = True
+    def _check_process(self) -> bool:
+        """GLib timer : vérifie si Chromium tourne encore."""
+        if self._proc and self._proc.poll() is not None:
+            self._cleanup()
+            return False   # arrête le timer
+        return True        # continue
 
-    def _toggle_fullscreen(self) -> None:
-        if self._is_fullscreen:
-            self._window.unfullscreen()
-            self._is_fullscreen = False
-        else:
-            self._window.fullscreen()
-            self._is_fullscreen = True
-
-    def _on_key_press(self, widget, event) -> bool:
-        kv = event.keyval
-        if kv == Gdk.KEY_Escape:
-            self.close()
-        elif kv in (Gdk.KEY_F11, ord('f')):
-            self._toggle_fullscreen()
-        return True
-
-    def _on_destroy(self, widget) -> None:
-        self._loaded = False
+    def _cleanup(self) -> None:
+        if self._http_server:
+            self._http_server.shutdown()
+            self._http_server = None
         if self._on_close_cb:
-            cb = self._on_close_cb
-            self._on_close_cb = None
-            cb()
+            cb, self._on_close_cb = self._on_close_cb, None
+            GLib.idle_add(cb)
 
     def close(self) -> None:
-        self._window.destroy()
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+        self._cleanup()
 
 
 class WalkingPadIndicator:
