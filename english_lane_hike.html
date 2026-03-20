@@ -767,12 +767,13 @@ canvas.addEventListener('touchstart', e => { const t = e.touches[0]; mx=t.client
 canvas.addEventListener('touchmove',  e => { const t = e.touches[0]; mx=t.clientX; my=canvas.clientHeight-t.clientY; }, {passive:true});
 canvas.addEventListener('touchend',   () => mb = 0, {passive:true});
 
-const RENDER_SCALE = 0.5; // résolution interne du shader (0.5 = 50%) — monter si trop flou
+const RENDER_SCALE = 0.75; // résolution interne du shader (0.75 = compromis qualité/fluidité)
 
-// Canvas = pleine résolution CSS (pour le compositor), rendu dans un FBO offscreen
+// Canvas = résolution physique (DPR pris en compte pour écrans HiDPI)
 function resize() {
-  canvas.width  = window.innerWidth;
-  canvas.height = window.innerHeight;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width  = Math.round(window.innerWidth  * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
 }
 resize();
 window.addEventListener('resize', resize);
