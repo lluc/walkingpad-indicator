@@ -716,6 +716,19 @@ const tex0 = mkTex1x1(), tex1 = mkTex1x1();
 let speed = 4.0, dist = 0.0, elapsed = 0.0;
 let paused = false, lastT = null, frame = 0;
 let mx = 0, my = 0, mb = 0;
+let _treadmill_connected = false, _treadmill_steps = 0;
+
+// Appelé par Python via WebKit2 run_javascript() (~1/s)
+window.updateTreadmill = function(speedKmh, distM, steps, elapsedS) {
+  if (!_treadmill_connected) {
+    document.getElementById('bar').style.display = 'none';
+    _treadmill_connected = true;
+  }
+  speed   = speedKmh;
+  dist    = distM;
+  elapsed = elapsedS;
+  _treadmill_steps = steps;
+};
 
 canvas.addEventListener('mousemove', e => { mx = e.clientX; my = canvas.clientHeight - e.clientY; });
 canvas.addEventListener('mousedown', e => { mb = 1; mx = e.clientX; my = canvas.clientHeight - e.clientY; });
@@ -724,10 +737,12 @@ canvas.addEventListener('touchstart', e => { const t = e.touches[0]; mx=t.client
 canvas.addEventListener('touchmove',  e => { const t = e.touches[0]; mx=t.clientX; my=canvas.clientHeight-t.clientY; }, {passive:true});
 canvas.addEventListener('touchend',   () => mb = 0, {passive:true});
 
+const RENDER_SCALE = 0.5; // rendu interne à 50% — ajuster si trop saccadé ou trop flou
+
 function resize() {
-  const dpr = Math.min(devicePixelRatio || 1, 1.5);
-  canvas.width  = window.innerWidth  * dpr;
-  canvas.height = window.innerHeight * dpr;
+  const dpr = (devicePixelRatio || 1) * RENDER_SCALE;
+  canvas.width  = Math.round(window.innerWidth  * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
 }
 resize();
 window.addEventListener('resize', resize);
@@ -777,7 +792,7 @@ function render(ts) {
   document.getElementById('h1').textContent = speed.toFixed(1) + ' km/h';
   document.getElementById('h2').textContent = (dist/1000).toFixed(2) + ' km';
   document.getElementById('h3').textContent = fmtTime(elapsed);
-  document.getElementById('h4').textContent = Math.round(dist/0.76) + ' pas';
+  document.getElementById('h4').textContent = (_treadmill_connected ? _treadmill_steps : Math.round(dist/0.76)) + ' pas';
 }
 
 requestAnimationFrame(render);
