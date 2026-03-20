@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Randonnée – English Lane (raymarching)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;width:100vw;height:100vh}
+canvas{width:100%;height:100%;display:block}
+#hud{position:fixed;top:0;left:0;right:0;background:rgba(8,10,14,.74);padding:5px 16px;display:flex;gap:24px;z-index:10;opacity:0;transition:opacity .6s}
+#hud span{color:#fff;font:13px/1.8 monospace}
+#bar{position:fixed;bottom:10px;left:10px;right:10px;display:flex;align-items:center;gap:10px;background:rgba(0,0,0,.66);border-radius:7px;padding:7px 14px;z-index:10}
+#bar span{color:#9ab;font-size:11px;white-space:nowrap}
+#bar #sl{color:#fff;min-width:60px}
+input[type=range]{flex:1;accent-color:#7ecf7e;height:3px}
+button{background:rgba(255,255,255,.12);border:none;border-radius:4px;color:#fff;font-size:13px;padding:3px 10px;cursor:pointer}
+#loading{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#cdd;font:14px monospace;background:#000;z-index:20;gap:16px}
+#loading p{opacity:.6;font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="loading">
+  <div>Compilation du shader… ≈15 secondes</div>
+  <p>English Lane · Jerome Liard (CC BY-NC-SA 3.0) · adapté pour randonnée</p>
+</div>
+<div id="hud">
+  <span id="h1">0.0 km/h</span>
+  <span id="h2">0.00 km</span>
+  <span id="h3">0:00:00</span>
+  <span id="h4">0 pas</span>
+</div>
+<div id="bar">
+  <button id="btn">⏸</button>
+  <span>Vitesse</span>
+  <input type="range" id="sp" min="0" max="20" step="0.1" value="4">
+  <span id="sl">4.0 km/h</span>
+</div>
+<script>
+// ══════════════════════════════════════════════════════════════════════════════
+//  Vertex shader – quad plein écran
+// ══════════════════════════════════════════════════════════════════════════════
+const VS = `#version 300 es
+layout(location=0) in vec2 aPos;
+void main(){ gl_Position = vec4(aPos, 0., 1.); }`;
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Fragment shader
+//  Base : "English Lane" by Jerome Liard, April 2021
+//  https://www.shadertoy.com/view/fsXXzX
+//  License CC BY-NC-SA 3.0
+//  Modifications pour randonnée tapis :
+//    • BUFFER_MODE 0  (single-pass, pas de reprojection)
+//    • CLOUD_MODE  0  (nuages désactivés pour les perfs)
+//    • GetCameraTransform remplacé par caméra randonnée pilotée par uDist
+//    • uniform uDist (mètres parcourus), uSpeed (km/h)
+// ══════════════════════════════════════════════════════════════════════════════
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+
+// ── Uniforms Shadertoy standard ──────────────────────────────────────────────
+uniform vec3  iResolution;
+uniform float iTime;
+uniform int   iFrame;
+uniform vec4  iMouse;
+uniform vec4  iDate;
+uniform sampler2D iChannel0;
+uniform sampler2D iChannel1;
+
+// ── Uniforms tapis de marche ─────────────────────────────────────────────────
+uniform float uDist;   // distance parcourue en mètres
+uniform float uSpeed;  // vitesse en km/h
+
+out vec4 fragColor;
+
+// ── Modifications par rapport à l'original ───────────────────────────────────
+#define BUFFER_MODE 0     // single-pass (pas de Buffer A/B)
+#define CLOUD_MODE  0     // nuages désactivés
+
+// ── Code original de Jerome Liard (English Lane) ─────────────────────────────
+#define DIFFERENT_LANE_EVERYDAY 0
+#if DIFFERENT_LANE_EVERYDAY==0
+#define FIRST_LANE_INDEX 10.0
+#else
+#define FIRST_LANE_INDEX (-80.0+mod(iDate.x*365.+iDate.y*31.+iDate.z,160.))
+#endif
+
+#define PI 3.141592654
+#define FLT_MAX 1000000.0
+#define SQR2 1.414213562
+#define SQR3 1.732050807
+#define RED   vec3(1,0,0)
+#define GREEN vec3(0,1,0)
+#define BLUE  vec3(0,0,1)
+#define WHITE vec3(1,1,1)
+#define BLACK vec3(0,0,0)
+#define MAGENTA vec3(1,0,1)
+#define YELLOW  vec3(1,1,0)
+#define AZURE   vec3(0.0,0.5,1.0)
+
+#define A_FEW_FUNC(type) \
+type saturate(type x){return clamp(x,type(0.0),type(1.0));} \
+type smoothstep_unchecked(type x){return(x*x)*(type(3.0)-x*2.0);} \
+type smoothstep_unchecked_d(type x){return 6.0*x*(type(1.0)-x);}
+A_FEW_FUNC(float) A_FEW_FUNC(vec2) A_FEW_FUNC(vec3) A_FEW_FUNC(vec4)
+
+float exp_decay(float x){return 1.-exp(-x);}
+float cubicbump(float x,float df0,float df1){float a=df1+df0;float c=df0;float b=-a-c;return x*(x*(x*a+b)+c);}
+float smoothbump(float a,float r,float x){return 1.0-smoothstep_unchecked(min(abs(x-a),r)/r);}
+float smoothstep_c(float x,float c,float r){return smoothstep(c-r,c+r,x);}
+float smoothband(float x,float r,float raa){return 1.-smoothstep_c(abs(x),r,raa);}
+float smoothband(float x,float s,float e,float raa){return smoothband(x-(e+s)*0.5,(e-s)*0.5,raa);}
+vec2 perp(vec2 v){return vec2(-v.y,v.x);}
+float calc_angle(vec2 v){return atan(v.y,v.x);}
+float calc_angle(vec2 a,vec2 b){return calc_angle(vec2(dot(a,b),dot(perp(a),b)));}
+float contrast(float x,float s){return(x-0.5)*s+0.5;}
+vec3  contrast(vec3 x,vec3 s){return(x-0.5)*s+0.5;}
+float lensqr(vec2 v){return dot(v,v);}
+float lensqr(vec3 v){return dot(v,v);}
+float lensqr(vec4 v){return dot(v,v);}
+float pow2(float x){return x*x;}
+vec3  pow2(vec3 x){return x*x;}
+vec4  pow2(vec4 x){return x*x;}
+float smin_exp2(float a,float b,float k){return-log2(exp2(-k*a)+exp2(-k*b))/k;}
+float smax_exp2(float a,float b,float k){return-smin_exp2(-a,-b,k);}
+float smin_pol(float a,float b,float k){float h=clamp(0.5+0.5*(b-a)/k,0.0,1.0);return mix(b,a,h)-k*h*(1.0-h);}
+float smax_pol(float a,float b,float k){return-smin_pol(-a,-b,k);}
+float powerful_scurve(float x,float p1,float p2){return pow(1.0-pow(1.0-clamp(x,0.0,1.0),p2),p1);}
+float maxcomp(float x){return x;}
+float maxcomp(vec2 v){return max(v.x,v.y);}
+float maxcomp(vec3 v){return max(max(v.x,v.y),v.z);}
+float min_(float x,float y,float z){return min(min(x,y),z);}
+float max_(float x,float y,float z){return max(max(x,y),z);}
+float nearest(float x){return floor(0.5+x);}
+float nearest(float x,float spacing){return floor(0.5+x/spacing)*spacing;}
+vec2  nearest(vec2 x,vec2 spacing){return floor(vec2(0.5)+x/spacing)*spacing;}
+float sum(vec4 v){return v.x+v.y+v.z+v.w;}
+float safe_acos(float x){return acos(clamp(x,-1.,1.));}
+
+#define PROJECT_ON_LINE1(type) \
+type project_on_line(type P,type O,type d){return O+d*dot(P-O,d)/dot(d,d);} \
+type project_on_plane(type P,type O,type n){return P-n*dot(P-O,n)/dot(n,n);}
+PROJECT_ON_LINE1(vec2) PROJECT_ON_LINE1(vec3)
+
+#define FAST_SIGNED_DISTANCE_TO_FUNC_11_ARG(a_signed_distance,a_p,a_func,a_arg,a_epsilon) \
+{vec2 _p=a_p;float _epsilon=a_epsilon;float _y=a_func(_p.x,a_arg);float _y1=a_func(_p.x+_epsilon,a_arg);float _ddy=(_y1-_y)*(1./_epsilon);a_signed_distance=(_p.y-_y)/sqrt(1.+_ddy*_ddy);}
+
+#define CLOSEST_POINT_TANGENT_TO_FUNCD_11_ARG_CHEAP(a_ret,a_p,a_funcd,a_funcd_arg,a_cheap) \
+{vec2 _p=a_p.xy,_c,_dc,_ev;float _t=_p.x;_ev=a_funcd(_t,a_funcd_arg);_c=vec2(_t,_ev.x);_dc=vec2(1.0,_ev.y);if(!(a_cheap)){_t+=dot(_p.xy-_c,_dc)/dot(_dc,_dc);_ev=a_funcd(_t,a_funcd_arg);_c=vec2(_t,_ev.x);_dc=vec2(1.0,_ev.y);}a_ret=vec4(_c-_p,_dc);}
+
+vec3 transform_vector(mat4 m,vec3 v){return(m*vec4(v,0.0)).xyz;}
+struct bounds2{vec2 pmin;vec2 pmax;};
+bounds2 mkbounds_unchecked(vec2 amin,vec2 amax){bounds2 ret;ret.pmin=amin;ret.pmax=amax;return ret;}
+
+#define REPEAT_FUNCTIONS(type) \
+type repeat(type x,type len){return len*fract(x*(type(1.0)/len));} \
+type repeat_mirror(type x,type len){return len*abs(type(-1.0)+2.0*fract(((x*(type(1.0)/len))-type(-1.0))*0.5));}
+REPEAT_FUNCTIONS(float) REPEAT_FUNCTIONS(vec2)
+
+float stripes(float x,float period,float r,float raa){return smoothstep(r+raa,r-raa,repeat_mirror(x,period*0.5));}
+vec2  stripes(vec2 x,vec2 period,vec2 r,vec2 raa){return smoothstep(r+raa,r-raa,repeat_mirror(x,period*0.5));}
+float tri_sin(float x){return(abs(fract((x-PI*0.5)/(PI*2.))-0.5)-0.25)*4.0;}
+
+float hash11(float p){p=fract(p*.1031);p*=p+33.33;p*=p+p;return fract(p);}
+float hash12(vec2 p){vec3 p3=fract(vec3(p.xyx)*.1031);p3+=dot(p3,p3.yzx+33.33);return fract((p3.x+p3.y)*p3.z);}
+float hash13(vec3 p3){p3=fract(p3*.1031);p3+=dot(p3,p3.yzx+33.33);return fract((p3.x+p3.y)*p3.z);}
+vec2  hash22(vec2 p){vec3 p3=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));p3+=dot(p3,p3.yzx+33.33);return fract((p3.xx+p3.yz)*p3.zy);}
+vec2  hash23(vec3 p3){p3=fract(p3*vec3(.1031,.1030,.0973));p3+=dot(p3,p3.yzx+33.33);return fract((p3.xx+p3.yz)*p3.zy);}
+vec3  hash31(float p){vec3 p3=fract(vec3(p)*vec3(.1031,.1030,.0973));p3+=dot(p3,p3.yzx+33.33);return fract((p3.xxy+p3.yzz)*p3.zyx);}
+vec3  hash32(vec2 p){vec3 p3=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));p3+=dot(p3,p3.yxz+33.33);return fract((p3.xxy+p3.yzz)*p3.zyx);}
+vec3  hash33(vec3 p3){p3=fract(p3*vec3(.1031,.1030,.0973));p3+=dot(p3,p3.yxz+33.33);return fract((p3.xxy+p3.yxx)*p3.zyx);}
+
+vec4 hash42_(ivec2 x0){uint k=1103515245U;uvec4 x=uvec4(x0,x0*0x8da6b343);x=((x>>13U)^x.yzwx)*k;x=((x>>13U)^x.zwxy)*k;return vec4(x)*(1.0/float(0xffffffffU));}
+float hash1u2_4tXyWN(uvec2 x){uvec2 q=1103515245U*((x>>1U)^(x.yx));uint n=1103515245U*((q.x)^(q.y>>3U));return float(n)*(1.0/float(0xffffffffU));}
+uint lowbias32(uint x){x^=x>>16;x*=0x7feb352dU;x^=x>>15;x*=0x846ca68bU;x^=x>>16;return x;}
+float hash11u_lowbias32(uint x){return float(lowbias32(x))/float(0xffffffffU);}
+
+#define V30 vec2(0.866025403,0.5)
+#define V45 vec2(0.707106781,0.707106781)
+#define V60 vec2(0.5,0.866025403)
+vec2 unit_vector2(float angle){return vec2(cos(angle),sin(angle));}
+vec2 rotate_with_unit_vector(vec2 p,vec2 cs){return vec2(cs.x*p.x-cs.y*p.y,cs.y*p.x+cs.x*p.y);}
+vec2 rotate_with_angle(vec2 p,float a){return rotate_with_unit_vector(p,unit_vector2(a));}
+vec3 zup_spherical_coords_to_vector(vec2 theta_vec,vec2 phi_vec){return vec3(theta_vec.y*phi_vec,theta_vec.x);}
+vec3 zup_spherical_coords_to_vector(float theta,float phi){return zup_spherical_coords_to_vector(unit_vector2(theta),unit_vector2(phi));}
+vec3 zup_spherical_coords_to_vector(vec2 tp){return zup_spherical_coords_to_vector(tp.x,tp.y);}
+vec2 vector_to_zup_spherical_coords(vec3 n){float theta=safe_acos(n.z);float phi=calc_angle(n.xy);return vec2(theta,phi);}
+vec3 yup_spherical_coords_to_vector(vec2 theta,vec2 phi){return zup_spherical_coords_to_vector(theta,phi).yzx;}
+vec3 yup_spherical_coords_to_vector(float theta,float phi){return yup_spherical_coords_to_vector(unit_vector2(theta),unit_vector2(phi));}
+mat4 yup_spherical_coords_to_matrix(vec2 theta,vec2 phi){vec3 y=yup_spherical_coords_to_vector(theta,phi);vec3 z=yup_spherical_coords_to_vector(perp(theta),phi);vec3 x=cross(y,z);return(mat4(vec4(x,0.0),vec4(y,0.0),vec4(z,0.0),vec4(0,0,0,1)));}
+mat4 yup_spherical_coords_to_matrix(float theta,float phi){return yup_spherical_coords_to_matrix(unit_vector2(theta),unit_vector2(phi));}
+mat4 z_rotation(float angle){vec2 v=unit_vector2(angle);return mat4(vec4(v.x,v.y,0.0,0.0),vec4(-v.y,v.x,0.0,0.0),vec4(0,0,1,0),vec4(0,0,0,1));}
+mat3 mat3_rotation_x(vec2 v){return mat3(vec3(1,0,0),vec3(0,v.x,v.y),vec3(0,-v.y,v.x));}
+mat3 mat3_rotation_z(vec2 v){return mat3(vec3(v.x,v.y,0),vec3(-v.y,v.x,0),vec3(0,0,1));}
+float ed_icdf(float u,float a){return-log(1.-u)*(1.0/a);}
+
+#define INDEXHASHOFFSET3 vec3(137.0,53.0,173)
+#define LAYERED1(func,p,args) ((func(p*1.0,args)*0.5)*(1.0/(0.5)))
+#define LAYERED2(func,p,args) ((func(p*1.0,args)*0.5+func(p*2.0,args)*0.25)*(1.0/((0.5+0.25))))
+#define LAYERED4(func,p,args) ((func(p*1.0,args)*0.5+func(p*2.0,args)*0.25+func(p*4.0,args)*0.125+func(p*8.0,args)*0.0625)*(1.0/((0.5+0.25+0.125+0.0625))))
+#define LAYERED5(func,p,args) ((func(p*1.0,args)*0.5+func(p*2.0,args)*0.25+func(p*4.0,args)*0.125+func(p*8.0,args)*0.0625+func(p*16.0,args)*0.03125)*(1.0/((0.5+0.25+0.125+0.0625+0.03125))))
+
+float noise12(vec2 p,bool use_smooth){p-=0.5;vec2 p00=floor(p);vec2 p10=p00+vec2(1,0);vec2 p01=p00+vec2(0,1);vec2 p11=p00+vec2(1,1);float v00=hash12(p00);float v10=hash12(p10);float v01=hash12(p01);float v11=hash12(p11);vec2 f=fract(p);if(use_smooth)f=smoothstep_unchecked(f);float A=v10-v00;float B=v01-v00;float C=(v11-v01)-A;float D=v00;return A*f.x+B*f.y+C*f.x*f.y+D;}
+float noise13(vec3 p,bool use_smooth){p-=0.5;vec3 p000=floor(p)+INDEXHASHOFFSET3;vec3 p100=p000+vec3(1,0,0);vec3 p010=p000+vec3(0,1,0);vec3 p110=p000+vec3(1,1,0);vec3 p001=p000+vec3(0,0,1);vec3 p101=p000+vec3(1,0,1);vec3 p011=p000+vec3(0,1,1);vec3 p111=p000+vec3(1,1,1);float v000=hash13(p000);float v100=hash13(p100);float v010=hash13(p010);float v110=hash13(p110);float v001=hash13(p001);float v101=hash13(p101);float v011=hash13(p011);float v111=hash13(p111);vec3 f=fract(p);if(use_smooth)f=smoothstep_unchecked(f);return mix(mix(mix(v000,v100,f.x),mix(v010,v110,f.x),f.y),mix(mix(v001,v101,f.x),mix(v011,v111,f.x),f.y),f.z);}
+vec3  noise33(vec3 p,bool use_smooth){p-=0.5;vec3 p000=floor(p)+INDEXHASHOFFSET3;vec3 p100=p000+vec3(1,0,0);vec3 p010=p000+vec3(0,1,0);vec3 p110=p000+vec3(1,1,0);vec3 p001=p000+vec3(0,0,1);vec3 p101=p000+vec3(1,0,1);vec3 p011=p000+vec3(0,1,1);vec3 p111=p000+vec3(1,1,1);vec3 v000=hash33(p000);vec3 v100=hash33(p100);vec3 v010=hash33(p010);vec3 v110=hash33(p110);vec3 v001=hash33(p001);vec3 v101=hash33(p101);vec3 v011=hash33(p011);vec3 v111=hash33(p111);vec3 f=fract(p);if(use_smooth)f=smoothstep_unchecked(f);return mix(mix(mix(v000,v100,f.x),mix(v010,v110,f.x),f.y),mix(mix(v001,v101,f.x),mix(v011,v111,f.x),f.y),f.z);}
+float enoise13(vec3 p,float a,bool use_smooth){p-=0.5;vec3 p000=floor(p)+INDEXHASHOFFSET3;vec3 p100=p000+vec3(1,0,0);vec3 p010=p000+vec3(0,1,0);vec3 p110=p000+vec3(1,1,0);vec3 p001=p000+vec3(0,0,1);vec3 p101=p000+vec3(1,0,1);vec3 p011=p000+vec3(0,1,1);vec3 p111=p000+vec3(1,1,1);vec2 h000=hash23(p000);vec2 h100=hash23(p100);vec2 h010=hash23(p010);vec2 h110=hash23(p110);vec2 h001=hash23(p001);vec2 h101=hash23(p101);vec2 h011=hash23(p011);vec2 h111=hash23(p111);float v000=ed_icdf(h000.x,a)*h000.y;float v100=ed_icdf(h100.x,a)*h100.y;float v010=ed_icdf(h010.x,a)*h010.y;float v110=ed_icdf(h110.x,a)*h110.y;float v001=ed_icdf(h001.x,a)*h001.y;float v101=ed_icdf(h101.x,a)*h101.y;float v011=ed_icdf(h011.x,a)*h011.y;float v111=ed_icdf(h111.x,a)*h111.y;vec3 f=fract(p);if(use_smooth)f=smoothstep_unchecked(f);return mix(mix(mix(v000,v100,f.x),mix(v010,v110,f.x),f.y),mix(mix(v001,v101,f.x),mix(v011,v111,f.x),f.y),f.z);}
+
+float snoise12_(vec2 p,float args){return noise12(p,true);}
+float snoise13_(vec3 p,float args){return noise13(p,true);}
+vec3  noise33_(vec3 p,float args){return noise33(p,false);}
+float enoise13_(vec3 p,float a){return enoise13(p,a,false);}
+float sfbm1_12(vec2 p){return LAYERED1(snoise12_,p,-1.0);}
+float sfbm2_13(vec3 p){return LAYERED2(snoise13_,p,-1.0);}
+float sfbm2_13_leaf(vec3 p){return(noise13(p*0.8,true)+noise13(p*4.0,true)*0.6)/1.5;}
+float sfbm2_12(vec2 p){return LAYERED2(snoise12_,p,-1.0);}
+float efbm4_13(vec3 p,float arg){return LAYERED4(enoise13_,p,arg);}
+vec3  sfbm4_33(vec3 p){return LAYERED5(noise33_,p,-1.0);}
+
+struct Ray{vec3 o;vec3 d;};
+Ray mkray(vec3 o,vec3 d){Ray tmp;tmp.o=o;tmp.d=d;return tmp;}
+
+vec3 get_view_dir(vec2 normalized_pos,float aspect,float tan_half_fovy_rcp){return normalize(vec3(normalized_pos.x*aspect,normalized_pos.y,-tan_half_fovy_rcp));}
+Ray  get_view_ray2(vec2 normalized_pos,float aspect,float tan_half_fovy_rcp,mat4 camera){return mkray(camera[3].xyz,transform_vector(camera,get_view_dir(normalized_pos,aspect,tan_half_fovy_rcp)));}
+
+mat4 lookat(vec3 eye,vec3 center,vec3 up){vec3 z=normalize(eye-center);vec3 x=normalize(cross(up,z));vec3 y=cross(z,x);return mat4(vec4(x,0.0),vec4(y,0.0),vec4(z,0.0),vec4(eye,1.0));}
+
+vec2 sphere_trace(Ray ray,float radius,vec3 center){vec3 O=ray.o;vec3 d=ray.d;float tp=dot(center-O,d);float h_sqr=lensqr((O+d*tp)-center);float radius_sqr=radius*radius;if(h_sqr>radius_sqr)return vec2(FLT_MAX,FLT_MAX);float dt=sqrt(radius_sqr-h_sqr);return vec2(tp-dt,tp+dt);}
+float plane_trace(vec3 ray_o,vec3 ray_d,vec3 base,vec3 n,float epsilon){float ddotn=dot(ray_d,n);return abs(ddotn)>epsilon?dot(base-ray_o,n)/ddotn:FLT_MAX;}
+float plane_trace(Ray ray,vec3 base,vec3 n,float epsilon){float ddotn=dot(ray.d,n);return abs(ddotn)>epsilon?dot(base-ray.o,n)/ddotn:FLT_MAX;}
+float plane_trace_z(Ray ray,float base,float epsilon){return abs(ray.d.z)>epsilon?(base-ray.o.z)/ray.d.z:FLT_MAX;}
+float plane_trace_z(vec3 d,float base,float epsilon){return abs(d.z)>epsilon?base/d.z:FLT_MAX;}
+float her2(float x,float r){return 0.5*((1.0/r)*x*x+r);}
+float curved_max_vfunc_weld_quadric(float x,float r){x=abs(x);return x>r?x:her2(x,r);}
+float opI(float d1,float d2){return max(d1,d2);}
+float opI_soft2(float a,float b,float k){return smax_exp2(a,b,k);}
+float opI_soft2_pol(float a,float b,float k){return smax_pol(a,b,k);}
+float opI_weld_quadric(float a,float b,float r){float c=(a+b)*0.5;return c+curved_max_vfunc_weld_quadric(a-c,r);}
+float opU(float d1,float d2){return-max(-d1,-d2);}
+float opU_soft2_pol(float a,float b,float k){return-opI_soft2_pol(-a,-b,k);}
+float opU_weld_quadric(float a,float b,float r){return-opI_weld_quadric(-a,-b,r);}
+float opS(float d1,float d2){return max(-d2,d1);}
+float opS_soft2(float a,float b,float k){return opI_soft2(-b,a,k);}
+float opI(float d1,float d2,float d3){return max(max(d1,d2),d3);}
+
+float sd_bounds_range_round(vec2 p,vec2 mi,vec2 ma,float r){vec2 h=(ma-mi)*0.5;p=abs(p-(mi+ma)*0.5);vec2 c=h-r;float mask=maxcomp(step(c,p));return mix(maxcomp(p-c),length(max(p-c,vec2(0.0))),mask)-r;}
+float sd_bounds_range_round(vec3 p,vec3 mi,vec3 ma,float r){vec3 h=(ma-mi)*0.5;p=abs(p-(mi+ma)*0.5);vec3 c=h-r;float mask=maxcomp(step(c,p));return mix(maxcomp(p-c),length(max(p-c,vec3(0.0))),mask)-r;}
+float sd_bounds_half_size(float p,float h){p=abs(p)-h;return p;}
+float sd_bounds_half_size(vec2 p,vec2 h){p=abs(p)-h;return opI(p.x,p.y);}
+float sd_bounds_half_size(vec3 p,vec3 h){p=abs(p)-h;return opI(p.x,p.y,p.z);}
+float sd_bounds_range(vec2 p,vec2 mi,vec2 ma){vec2 hmi=mi*0.5;vec2 hma=ma*0.5;return sd_bounds_half_size(p-(hma+hmi),hma-hmi);}
+float sd_bounds_range(float p,float mi,float ma){return sd_bounds_half_size(p-((ma+mi)*0.5),(ma-mi)*0.5);}
+float sd_bounds_range(vec3 p,vec3 mi,vec3 ma){return sd_bounds_half_size(p-((ma+mi)*0.5),(ma-mi)*0.5);}
+float sd_sphere(vec3 p,vec3 center,float radius){return length(p-center)-radius;}
+float sd_sphere(vec2 p,vec2 center,float radius){return length(p-center)-radius;}
+float sdCylinder(vec3 p,vec2 h){vec2 d=abs(vec2(length(p.xy),p.z))-h;return min(max(d.x,d.y),0.0)+length(max(d,vec2(0.0)));}
+
+float packed_spheres_tiling3d_internal_layer(vec3 p){vec2 rh=vec2(1.0,SQR3);vec2 c=rh*2.0;vec2 i1=floor(p.xy/c);vec2 i2=floor((p.xy-rh)/c);return min(length(p-vec3((i1+vec2(0.5))*c,0))-1.0,length(p-vec3((i2+vec2(0.5))*c+rh,0))-1.0);}
+float packed_spheres_tiling3d(vec3 p){vec3 p0=p;float h=SQR3;float b=(1.0-h*h)/(-2.0*h);float c=h-b;float h3=sqrt(2.0*2.0-c*c);p=p0;p.z-=(floor((p.z-(-h3))/(2.0*h3))+0.5)*(2.0*h3)-h3;float d1=packed_spheres_tiling3d_internal_layer(p);p=p0;p.y+=h-b;p.z-=(floor((p.z-0.0)/(2.0*h3))+0.5)*(2.0*h3)-0.0;float d2=packed_spheres_tiling3d_internal_layer(p);return min(d1,d2);}
+float packed_spheres_tiling3d(vec3 p,float r,float spacing){float s=spacing*0.5;return packed_spheres_tiling3d(p*(1.0/s))*s+(s-r);}
+float packed_spheres_tiling3d(vec3 p,float r){return packed_spheres_tiling3d(p*(1.0/r))*r;}
+
+vec3 tonemap_reinhard(vec3 x){return x/(1.+x);}
+vec3 gamma_correction_itu(vec3 L){return mix(4.5061986*L,1.099*pow(L,vec3(0.45))-0.099,step(vec3(0.018),L));}
+
+struct SG{vec3 Amplitude;vec3 Axis;float Sharpness;};
+vec3 ApproximateSGIntegral(in SG sg){return 2.*PI*(sg.Amplitude/sg.Sharpness);}
+SG CosineLobeSG(in vec3 direction){SG cosineLobe;cosineLobe.Axis=direction;cosineLobe.Sharpness=2.133;cosineLobe.Amplitude=vec3(1.17);return cosineLobe;}
+vec3 SGIrradianceFitted(in SG lightingLobe,in vec3 normal){float muDotN=dot(lightingLobe.Axis,normal);float lambda=lightingLobe.Sharpness;float c0=0.36;float c1=1.0/(4.0*c0);float eml=exp(-lambda);float em2l=eml*eml;float rl=1.0/lambda;float scale=1.0+2.0*em2l-rl;float bias=(eml-em2l)*rl-em2l;float x=sqrt(1.0-scale);float x0=c0*muDotN;float x1=c1*x;float n=x0+x1;float y=saturate(muDotN);if(abs(x0)<=x1)y=n*n/x;float result=scale*y+bias;return result*ApproximateSGIntegral(lightingLobe);}
+vec3 SGDiffuseFitted(in SG lightingLobe,in vec3 normal,vec3 albedo){vec3 brdf=albedo/PI;return SGIrradianceFitted(lightingLobe,normal)*brdf;}
+
+#define _1 true
+#define _0 false
+
+#define SHADOW_TINT_SATURATION 0.45
+#define AO _0
+#define SHADOWS _1
+#define SUN _1
+#define SUN_GLARE _0
+#define GROUND_OCCLUSION _1
+#define PATH _1
+#define GRASS _1
+#define BUSH _1
+#define TREE _1
+#define FARM _1
+#define BRICKWALL _1
+#define TAYLOR_HEIGHT_BUSH _1
+#define TAYLOR_HEIGHT_TREE _1
+#define TAYLOR_HEIGHT_FARM _0
+#define GHOST_STEPS_PATCH _1
+#define GHOST_STEPS_TREE _1
+#define GHOST_STEPS_FARM _1
+#define GHOST_MAX_DIST_FROM_T0 7.0
+#define GHOST_MAX_DIST_ABS 25.0
+#define GHOST_EPS 0.0001
+#define DISPLACE_PATH _1
+#define DISPLACE_PATH_AMPL 0.002
+#define DISPLACE_PINE _1
+#define DISPLACE_TREE _1
+#define DISPLACE_BUSH _1
+#define DISPLACE_BUSH_FREQ 8.0
+#define WIND_BUSH _1
+#define WIND_TREE_AND_PINES _1
+#define FARM_WINDOWS _1
+#define SOFT_BLEND_BUSH _1
+#define SQUARE_BUSH_TEST _1
+#define TERRAIN_WARP
+
+#define MATID_NONE    0.0
+#define MATID_BUSH    1.0
+#define MATID_TRUNK   2.0
+#define MATID_HOUSE   3.0
+#define MATID_ROOF    4.0
+#define MATID_PINE    5.0
+#define MATID_BRICKWALL   6.0
+#define MATID_GRASS   7.0
+#define MATID_GROUND  8.0
+#define MATID_TREE    9.0
+#define MATID_WINDOW 10.0
+#define MATID_HOUSE_BOTTOM 11.0
+
+#define BROWN (vec3(133,84,57)/255.0)
+#define PATH_COLOR BROWN
+#define PATH_COLOR2 (BROWN*0.8)
+#define COLOR_BUSH1 (0.8*vec3(0.07,0.3,0.05))
+#define COLOR_BUSH2 (0.55*vec3(0.12,0.6,0.2))
+#define COLOR_BUSH3 (0.55*vec3(0.1,0.35,0.09))
+#define COLOR_BUSH4 (0.82*vec3(0.18,0.39,0.06))
+#define COLOR_BUSH5 vec3(0.1,0.3,0.01)
+#define COLOR_TREE1 (vec3(0.1,0.35,0.09)*0.55)
+#define COLOR_TREE2 (vec3(0.1,0.45,0.08)*0.8)
+#define COLOR_TREE_SURF vec3(0.15,0.4,0.04)
+#define COLOR_GRASS  vec3(0.1,0.35,0.09)
+#define COLOR_GRASS2 vec3(0.35,0.39,0.06)
+#define COLOR_MOWED_GRASS  vec3(0.17,0.37,0.05)
+#define COLOR_MOWED_GRASS2 (COLOR_MOWED_GRASS*0.6)
+#define COLOR_PINE  (vec3(0.4,1.0,0.2)*0.2)
+#define COLOR_PINE2 (vec3(0.5,1.0,0.0)*0.32)
+#define COLOR_TRUNK (BROWN*0.5)
+#define COLOR_ROOF1 (vec3(0.6,0.2,0.3)*0.7)
+#define COLOR_ROOF2 (vec3(0.1,0.4,0.5)*0.7)
+#define COLOR_BRICKWALL mix(vec3(0.52,0.33,0.22),vec3(0.9,0.9,0.7),0.35)
+#define COLOR_HOUSE mix((vec3(1,1,1)*0.65),COLOR_BRICKWALL,0.1)
+#define COLOR_HOUSE_BOTTOM (COLOR_HOUSE*0.7)
+
+struct CellPoint{vec2 p;ivec2 _pi;float pradius;};
+struct DistanceId{float d;float id;};
+DistanceId MkDistanceId(float d,float id){DistanceId v;v.d=d;v.id=id;return v;}
+DistanceId MkDistanceId_16(float d,float id,float id_fraction){return MkDistanceId(d,float(int(id)|(int(id_fraction*65535.0)<<5)));}
+DistanceId MkDistanceId_5_5_5(float d,float id,vec3 v){return MkDistanceId(d,float(int(id)|(int(v.x*31.0)<<5)|(int(v.y*31.0)<<10)|(int(v.z*31.0)<<15)));}
+vec2 DecodeId_16(DistanceId di){int i=int(di.id);return vec2(float(i&31),float(i>>5)*(1.0/65535.0));}
+float DecodeId(DistanceId di){int i=int(di.id);return float(i&31);}
+vec4 DecodeId_5_5_5(DistanceId di){int i=int(di.id);return vec4(float(i&31),float((i>>5)&31)*(1.0/31.0),float((i>>10)&31)*(1.0/31.0),float((i>>15)&31)*(1.0/31.0));}
+DistanceId opUdi(DistanceId a,DistanceId b){if(a.d<b.d)return a;return b;}
+
+#define LANEWIDTH 0.08
+#define LANE_FUNC 1
+#define PATH_SPACING_Y 1.0
+
+vec2 PathNoise11sD(float x){x-=0.5;float fr=fract(x);int x0=int(x-fr);uint i=uint(x0);float y0=hash11u_lowbias32(i);float y1=hash11u_lowbias32(i+1u);float f=smoothstep_unchecked(fr);float fd=smoothstep_unchecked_d(fr);return vec2(mix(y0,y1,f),(y1-y0)*fd);}
+
+vec2 wavyLaneFuncAndDerivative(float x,float lane_index){
+#if LANE_FUNC==1
+  float a=mix(0.9,2.0,(1.0+cos(lane_index))*0.5);float z=(1.0+sin(x*a))*0.5;return vec2(z*z,a*z*cos(a*x));
+#elif LANE_FUNC==2
+  return vec2(0.5,0);
+#else
+  float a=mix(0.5,1.7,(1.0+cos(lane_index))*0.5);return vec2((sin(a*x)+1.0)*0.5,0.5*a*cos(a*x));
+#endif
+}
+vec2 wavyLaneFuncAndDerivative_WORLD(float x,float lane_index){return wavyLaneFuncAndDerivative(x,lane_index)+vec2(lane_index*PATH_SPACING_Y,0);}
+
+vec4 sdWavyLane(vec2 p,float lane_index,bool cheap){vec4 ret;CLOSEST_POINT_TANGENT_TO_FUNCD_11_ARG_CHEAP(ret,p,wavyLaneFuncAndDerivative,lane_index,cheap)return ret;}
+
+struct SceneIn{vec3 v;vec3 v_rcp;int trace_flags;vec3 p;float t0;float t;};
+struct ClosestPath{DistanceId patch_di;vec2 v2closest;float curve_local_param;};
+vec2 GetLocalCurvePoint(ClosestPath path){return vec2(path.curve_local_param,length(path.v2closest));}
+
+ClosestPath EvalClosestPathSlab(vec2 p,float spacing,bool cheap){float id1=floor(p.y/spacing);p.y=p.y-id1*spacing;vec4 c1=sdWavyLane(p,id1,cheap);float d1=cheap?abs(c1.y):length(c1.xy);float s1=sign(c1.y);float id2=id1-s1;vec4 c2=sdWavyLane(p+vec2(0,s1*spacing),id2,cheap);float d2=cheap?abs(c2.y):length(c2.xy);float s2=sign(c2.y);float m=s2<0.0?id1:id1-s1;ClosestPath eval;if(d1<d2){eval.patch_di.d=d1;eval.v2closest=c1.xy;}else{eval.patch_di.d=d2;eval.v2closest=c2.xy;}eval.patch_di.id=m;eval.curve_local_param=p.x;return eval;}
+
+ClosestPath EvalClosestPath(vec2 p,bool cheap){ClosestPath ev1=EvalClosestPathSlab(p,PATH_SPACING_Y,cheap);vec2 p2=perp(p);float spacing2=(1.0+4.0*(sin(ev1.patch_di.id*10.0)+1.0)*0.5);ClosestPath ev2=EvalClosestPathSlab(p2,spacing2,cheap);ev2.v2closest=-perp(ev2.v2closest);ClosestPath eval=ev1;eval.patch_di.id*=ev2.patch_di.id;if(ev2.patch_di.d<ev1.patch_di.d){eval.patch_di.d=ev2.patch_di.d;eval.v2closest=ev2.v2closest;eval.curve_local_param=ev2.curve_local_param;}return eval;}
+
+#define MAX_TERRAIN_HEIGHT 0.74
+#define TALLEST_OBJECT_HEIGHT 0.645
+float sin_bumps_array(vec2 p){return sin(p.x)*sin(p.y)+1.0;}
+float BaseGroundHeight(vec2 p){float h=sin_bumps_array(p.xy*(0.16*PI))*0.5;return h*h*MAX_TERRAIN_HEIGHT;}
+
+float pine_tree_cross_section(float x,vec2 rh){x/=rh.y;return cubicbump(x,3.0,-0.98)*rh.x;}
+float sdRevolutionPine(vec3 p,float r,float h){vec2 p2d=vec2((p.z),length(p.xy));if(p2d.x>=h)return length(p2d-vec2(h,0));if(p2d.x<=0.0)return length(p2d-vec2(0,0));float d;FAST_SIGNED_DISTANCE_TO_FUNC_11_ARG(d,p2d,pine_tree_cross_section,vec2(r,h),1e-3);return d;}
+vec3 ApplyWind(vec3 pd,float aTime){return vec3(sin(aTime*0.8+pd.zx)*0.0003,0);}
+float ddPineSurfLayer(vec3 p){p*=400.0;p.z*=0.25;p.xy=rotate_with_angle(p.xy,p.z*0.11);return((tri_sin(p.x)+tri_sin(p.y)+tri_sin(p.z))+3.)*(1./6.);}
+float ddPineSurf(vec3 p){return(ddPineSurfLayer(p)+ddPineSurfLayer(vec3(rotate_with_angle(p.xy,0.5),p.z)*0.5))*(1./(2.5));}
+float sdDisplacePine(vec3 p,float d,float uheight){if(!DISPLACE_PINE)return d;float dd_amp=0.018;if(d>dd_amp)return d;dd_amp*=ddPineSurf(p);return d+dd_amp;}
+
+#define TRACE_VIEW 1
+#define TRACE_SHADE 2
+#define TRACE_AO 4
+#define TRACE_SHADOW 16
+#define TRACE_HAS_DIRECTION 64
+bool IsShadeTrace(int trace_flags){return(trace_flags&TRACE_SHADE)!=0;}
+bool IsShadowTrace(int trace_flags){return(trace_flags&TRACE_SHADOW)!=0;}
+bool HasDirection(int trace_flags){return(trace_flags&TRACE_HAS_DIRECTION)!=0;}
+
+#define TREE_SDD 0.02
+DistanceId sdTreeLeaves(vec3 p,vec2 c,float cz,float trunk_height,float leaves_volume_base_radius,float leaves_volume_top_radius,int trace_flags,float color_rnd){
+  float d=FLT_MAX;vec3 c0=vec3(c,cz+trunk_height*0.7);vec3 c1=vec3(c,cz+trunk_height);float d0=length(p-c0)-leaves_volume_base_radius;float d1=length(p-c1)-leaves_volume_top_radius;float k=leaves_volume_base_radius*0.4;d=opU_soft2_pol(d0,d1,k);
+  float dd1=0.007;if(d>dd1+TREE_SDD)return MkDistanceId(d,MATID_TREE);
+  float d_envelope=d;bool blend=_1;float depth=0.0;float uheight=0.0;
+  if(_1){mat3 m3=mat3_rotation_x(unit_vector2(radians(c.x*200.)))*mat3_rotation_z(unit_vector2(radians(c.y*200.)));float dl1;{float c1r=leaves_volume_base_radius*0.3;float da1=packed_spheres_tiling3d(p*m3,c1r,c1r*2.5);da1+=smoothstep(cz+trunk_height*0.75,cz+trunk_height,p.z)*0.007;dl1=blend?opI_weld_quadric(d_envelope,da1,leaves_volume_base_radius*0.3):opI(d_envelope,da1);}float dl2;{float c1r=leaves_volume_base_radius*0.4;float da1=packed_spheres_tiling3d(m3*p,c1r,c1r*2.5);dl2=blend?opI_weld_quadric(d_envelope,da1,leaves_volume_base_radius*0.25):opI(d_envelope,da1);}float d_leaf_clusters=blend?opU_weld_quadric(dl1,dl2,leaves_volume_base_radius*0.1):opU(dl1,dl2);d=blend?opU_weld_quadric(d_leaf_clusters,d_envelope+0.02,leaves_volume_base_radius*0.19):d_leaf_clusters;depth=saturate(1.0/(1.+abs(d-d_envelope)*100.));float b=c0.z-leaves_volume_base_radius;float t=c1.z+leaves_volume_top_radius;uheight=saturate((p.z-b)/(t-b));}
+  if(_1){float clipsurf=((c0.z-leaves_volume_base_radius*.6)+leaves_volume_base_radius*0.1*(sin_bumps_array(p.xy*(13.0*PI))-2.4));d=blend?opI_weld_quadric(d,-(p.z-clipsurf),leaves_volume_base_radius*0.15):opI(d,-(p.z-clipsurf));}
+  return MkDistanceId_5_5_5(d,MATID_TREE,saturate(vec3(depth,uheight,color_rnd)));
+}
+
+float CalcHeight(vec2 c,vec2 p,vec3 h_gradval,bool taylor_expansion_height){return taylor_expansion_height?h_gradval.z+dot(h_gradval.xy,c-p):BaseGroundHeight(c);}
+
+struct CloseGridPointArgs{float cell_size,max_radius,radius_disparity;};
+struct CloseGridPointArgsWithBand{CloseGridPointArgs args0;float band_start,band_end;bool taylor_expansion_height;};
+
+#define FORCE_LOOP +min(0,iFrame)
+#define FORCE_LOOPF +min(0.0,float(iFrame))
+
+struct SceneOut{DistanceId object_di;float d_ghost;float base_height;ClosestPath path;ClosestPath test2d;vec3 color;
+#ifdef TERRAIN_WARP
+float terrain_warp;
+#endif
+};
+void SceneOutInit(inout SceneOut eval){eval.d_ghost=FLT_MAX;}
+
+vec3 get_bush_palette(vec2 uv){return mix(mix(mix(COLOR_BUSH1,COLOR_BUSH2,uv.x),mix(COLOR_BUSH3,COLOR_BUSH4,uv.x),uv.y),COLOR_BUSH5,smoothband(uv.x,0.49,0.51,0.01));}
+bool is_white_cell(vec2 p_index){return(int(p_index.x+p_index.y)&1)==1;}
+
+void consider_close_point_hi(inout float d,vec2 index,float r,inout vec4 color,vec3 p,float cellsize,vec3 h_gradval,bool taylor_expansion_height,int trace_flags){vec3 c;vec3 h=hash32(index);c.xy=(index+h.xy)*cellsize;c.z=CalcHeight(c.xy,p.xy,h_gradval,taylor_expansion_height)+r*mix(-0.8,1.3,h.z);float di=length(c-p)-r;d=min(d,di);if(IsShadeTrace(trace_flags)){vec2 ch=hash22(index);float w=max(1.-smoothstep(-r*0.1,r*0.25,di),1e-3);color.xyz+=get_bush_palette(ch)*w;color.a+=w;}}
+
+float GetCloseGridPoints45(inout vec3 a_color,vec3 p,float cellsize,vec3 h_gradval,CloseGridPointArgsWithBand args,int trace_flags,int aFrame){float r=args.args0.max_radius*0.8;vec2 p_index=floor(p.xy*(1.0/cellsize));float d=FLT_MAX;vec4 color=vec4(0.0);vec2 offset=vec2(0,1);if(!is_white_cell(p_index)){consider_close_point_hi(d,p_index,r,color,p,cellsize,h_gradval,args.taylor_expansion_height,trace_flags);offset=vec2(1,1);}for(int i=0 FORCE_LOOP;i<4;++i){consider_close_point_hi(d,p_index+offset,r,color,p,cellsize,h_gradval,args.taylor_expansion_height,trace_flags);offset=perp(-offset);}if(IsShadeTrace(trace_flags))a_color=color.xyz/color.a;return d;}
+
+#define bush_max_radius 0.04
+void AddContributionBushes(inout SceneOut eval,SceneIn scenein,vec3 h_gradval,float groundz,vec3 patch_id_hash,bool is_forest_patch,float aTime,int aFrame){
+  vec3 p=scenein.p;bool has_bushes=patch_id_hash.x>0.2;bool has_cut_bushes=SQUARE_BUSH_TEST&&(!is_forest_patch&&patch_id_hash.x>0.62);float bush_cell_size=0.095;
+  float bush_d_min=p.z-(groundz+bush_max_radius*1.9);
+  if(!has_bushes||(bush_d_min>eval.object_di.d)
+#ifdef TERRAIN_WARP
+  ||((eval.terrain_warp!=0.0)&&(bush_d_min>0.0)&&(bush_d_min<eval.terrain_warp))
+#endif
+  )return;
+  float d=FLT_MAX;float id_fraction=0.0;float freq=1.0;
+  if(has_cut_bushes){freq=DISPLACE_BUSH_FREQ;vec2 p_patch_section=vec2(eval.path.patch_di.d,p.z-eval.base_height);float d_square_bush=sd_bounds_range(p_patch_section,vec2(LANEWIDTH-0.015,0),vec2(LANEWIDTH+0.02,0.05));d=d_square_bush;eval.color=COLOR_BUSH3;}
+  else{freq=DISPLACE_BUSH_FREQ;CloseGridPointArgsWithBand args;args.args0.cell_size=bush_cell_size;args.args0.max_radius=bush_max_radius;args.args0.radius_disparity=0.4;args.band_start=LANEWIDTH*0.5+args.args0.max_radius*0.5;args.band_end=args.band_start+0.18+pow2(patch_id_hash.z)*0.3;args.taylor_expansion_height=TAYLOR_HEIGHT_BUSH;d=GetCloseGridPoints45(eval.color,p,args.args0.cell_size*0.5,h_gradval,args,scenein.trace_flags,aFrame);if(SOFT_BLEND_BUSH)d=opU_weld_quadric(p.z-eval.base_height,d,0.027);if(_1)d=opS_soft2(d,abs(eval.path.patch_di.d)-LANEWIDTH*0.5,100.0);if(_1){float bf=(sfbm1_12(p.xy*18.0)-0.5)*0.33;d=opS_soft2(d,args.band_end*(1.+bf)-eval.path.patch_di.d,30.0);}}
+  if(DISPLACE_BUSH){float dd=0.0045;vec3 pd=p;if(WIND_BUSH)pd+=ApplyWind(pd,aTime);if(d<dd*3.0)d-=sfbm2_13(pd*vec3(80.0,80.0,100)*freq)*dd;}
+  eval.object_di=opUdi(eval.object_di,MkDistanceId_16(d,MATID_BUSH,id_fraction));
+}
+
+void GetClosestGridPoint(inout CellPoint point,vec2 p,CloseGridPointArgs args0,float grid_offset,float hoffset){vec2 pi=floor((p-grid_offset)/args0.cell_size);point._pi=ivec2(pi+vec2(hoffset));vec4 ph=hash42_(point._pi);point.pradius=args0.max_radius*(1.0-args0.radius_disparity*ph.z);vec2 a=grid_offset+pi*args0.cell_size;vec2 b=a+vec2(args0.cell_size);point.p=mix(a+vec2(point.pradius),b-vec2(point.pradius),ph.xy);}
+
+bool GetClosestGridPointWithPathBand_x1(inout CellPoint point,vec2 p,vec3 h_gradval,CloseGridPointArgsWithBand args,float grid_offset,float hoffset){GetClosestGridPoint(point,p,args.args0,grid_offset,hoffset);float distance_to_patch_border=abs(EvalClosestPath(point.p,true).patch_di.d);return(distance_to_patch_border>args.band_start)&&(distance_to_patch_border<args.band_end);}
+
+void SetSceneInDirection(inout SceneIn scenein,vec3 o,vec3 v,int trace_flags){scenein.v=v;scenein.v_rcp=vec3(1.0)/v;scenein.trace_flags=trace_flags|TRACE_HAS_DIRECTION;scenein.t0=0.0;}
+void SetSceneInDirectionless(inout SceneIn scenein,int trace_flags){scenein.v=vec3(0.0);scenein.v_rcp=vec3(0.0);scenein.trace_flags=trace_flags;scenein.t0=0.0;}
+
+float ClampRayAgainstCurrentGridCell(vec3 p,vec3 v_rcp,vec3 cell_size,float cell_inflate_epsilon){vec3 s=sign(v_rcp);vec3 amin=floor(p/cell_size)*cell_size;amin-=vec3(cell_inflate_epsilon);vec3 a=amin+((s+1.0)*0.5)*(cell_size+2.0*vec3(cell_inflate_epsilon));vec3 t=(a-p)*v_rcp;return min(min(t.x,t.y),t.z);}
+bool CanGhostStep(SceneIn scenein,float maxdist_from_t0,float maxdist_abs){return HasDirection(scenein.trace_flags)&&(scenein.t<maxdist_abs)&&((scenein.t-scenein.t0)<maxdist_from_t0);}
+void GhostGridSteps(inout SceneOut eval,SceneIn scenein,float cell_size,float cell_inflate_epsilon){float dm=ClampRayAgainstCurrentGridCell(scenein.p,scenein.v_rcp,vec3(cell_size,cell_size,20.0),cell_inflate_epsilon);eval.d_ghost=min(eval.d_ghost,max(dm,GHOST_EPS));}
+
+DistanceId sdGridObj_TreeOrPine(DistanceId di,vec3 p,CellPoint cr,float radius_fraction,float patch_id,inout vec3 color,SceneIn scenein,vec3 h_gradval,bool taylor_expansion_height){
+  vec2 c=cr.p;float r=radius_fraction*cr.pradius;float cz=CalcHeight(cr.p,p.xy,h_gradval,taylor_expansion_height);
+  vec4 hhh=hash42_(cr._pi*123);vec3 tree_base_point=vec3(c,cz);float pine_dice_roll=hhh.x;float pine_probability=0.7;
+  if(_1&&(pine_dice_roll>pine_probability)){float pine_radius_scale=mix(0.65,0.75,hhh.w)*r;float pine_height=mix(0.42,0.56,hhh.z*hhh.z);float uheight=saturate((p.z-cz)/pine_height);DistanceId pine_tree=MkDistanceId_5_5_5(sdDisplacePine(p-tree_base_point,sdRevolutionPine(p-tree_base_point,pine_radius_scale,pine_height),uheight),MATID_PINE,vec3(0.0,uheight,((hhh.x-pine_probability)*(1.0/(1.0-pine_probability)))));return opUdi(di,pine_tree);}
+  hhh.x*=1.0/pine_probability;float aa=mix(0.018,0.012,hhh.y);float trunk_height=aa*(1.1*1.0/0.018)*mix(0.2,0.35,hhh.z*hhh.z);float trunk_radius=aa*0.8;float leaves_volume_top_radius=mix(0.5,0.7,hhh.w)*r;float leaves_volume_base_radius=mix(1.1,1.35,hhh.y)*leaves_volume_top_radius;DistanceId leaves=sdTreeLeaves(p,c,cz,trunk_height,leaves_volume_base_radius,leaves_volume_top_radius,scenein.trace_flags,hhh.x);float trunk_uheight=saturate((p.z-cz)/trunk_height);trunk_radius*=mix(0.8,1.2,pow2(1.0-saturate(trunk_uheight*3.5)));DistanceId trunk=MkDistanceId(sdCylinder(p-tree_base_point,vec2(trunk_radius,trunk_height)),MATID_TRUNK);if(trunk.d<0.)leaves=trunk;return opUdi(di,opUdi(trunk,leaves));
+}
+
+float hard_waves(float x,float a1,float a2,float p){x=repeat(x,p);return min(a1*x,a2*(x-p));}
+float hf_SurfaceRoofTiles(vec2 p){return 0.1*hard_waves(p.y,0.3,-1.1,0.024)+0.001*(1.0-pow2(1.0-abs(sin(p.x*200.))));}
+
+struct WindowOrDoorArg{vec2 c;vec2 g;float frame_width,border_height,border_depth,glass_depth,frame_depth;};
+void sdOneWindow(vec3 p,inout DistanceId eval,WindowOrDoorArg args){float d_in=eval.d;vec2 c=args.c;vec2 g=args.g-vec2(1);p.x+=(args.g.x*0.5-0.5)*c.x;vec2 pmin=-c.xy*0.5;vec2 pmax=c.xy*(vec2(0.5)+g);vec3 pr=p;vec2 i=floor((pr.xy-(-c*0.5))/c);i=clamp(i,vec2(0,0),g);pr.xy-=i*c;float d_glass=sd_bounds_half_size(pr,vec3(c*0.5-vec2(args.frame_width)*0.5,args.glass_depth));eval.d=opS(eval.d,d_glass);float d_frame=sd_bounds_range(p,vec3(pmin,-args.frame_depth),vec3(pmax,args.frame_depth));eval.d=opS(eval.d,d_frame);if(_1)eval.d=opI(d_in-args.border_depth,opU(eval.d,sd_bounds_range(p,vec3(pmin.x,pmin.y-args.border_height,0),vec3(pmax.x,pmin.y,args.border_depth))));if(-d_glass==eval.d)eval.id=MATID_WINDOW;}
+void addWindow(inout DistanceId eval,vec3 p,float is_chimney_face,float half_wall_width){p.y+=0.016;vec2 c=vec2(0.07*mix(1.8,1.0,is_chimney_face),0.07);vec2 window_size=vec2(0.018,0.02);vec2 i=floor((p.xy-(-c.xy*0.5))/c.xy);float maxnum_cells=floor((half_wall_width/c.x)-0.5);ivec2 imin=ivec2(-maxnum_cells,1);ivec2 imax=ivec2(maxnum_cells,1);i=clamp(i,vec2(imin),vec2(imax));p.xy-=i*c;WindowOrDoorArg args;args.c=window_size;args.g=mix(vec2(2,2),vec2(2,2),is_chimney_face);float scl=0.012;args.frame_width=0.05*scl;args.border_height=0.3*scl;args.border_depth=0.2*scl;args.glass_depth=0.3*scl;args.frame_depth=0.1*scl;sdOneWindow(p,eval,args);}
+vec3 p2yface(vec3 p,vec2 orig){p.y=abs(p.y);p.xy-=orig;p.xzy=p.xyz;p.x=-p.x;return p;}
+vec3 p2xface(vec3 p,vec2 orig){p.x=abs(p.x);p.xy-=orig;return p.yzx;}
+
+DistanceId sdFarm(vec3 p,CellPoint cr,float patch_id,float r,float detail){
+  vec4 hh=hash42_(cr._pi);bool has_chimney=hh.y>0.4;bool _x2chimney=_1;vec2 hs1=vec2(0.25,0.083);vec2 hs2=vec2(0.083,0.18+hh.z*0.02);float h=0.0996;float bottom_block_inset=0.00498;float bottom_block_inset2=bottom_block_inset*(has_chimney?0.0:1.0);float roof_thickness=0.00166;float chimney_side_len=0.018+hh.z*0.002;float chimney_height=h+hs1.y+chimney_side_len;float chimney_bottom=h+hs1.y-0.04;float roof_tile_scl=2.5;float roof_tile_scl2=1.1;bool half_hipped=hh.z>0.5;float bottom_inflate=0.001;vec2 hs1_in=hs1-vec2(bottom_block_inset2,bottom_block_inset);vec2 hs2_in=hs2-vec2(bottom_block_inset);float block1_chimney_wall_plane_x=hs1_in.x;float block1_wall_plane_y=hs1_in.y;float block2_wall_plane_y=hs2_in.y;vec3 ps=p;vec3 pay=p;pay.y=abs(pay.y);vec3 pax=p;pax.x=abs(pax.x);float d_block1_bottom=FLT_MAX;float d_block1_roof=FLT_MAX;float d_block1_bottom2=FLT_MAX;{bounds2 block1=mkbounds_unchecked(-hs1,hs1);float d_block1_footprint=sd_bounds_range(p.xy,block1.pmin.xy,block1.pmax.xy);vec3 roof1_top_point=vec3(hs1.x,0,h+hs1.y);vec3 roof_plane_local_p=vec3(-dot(pay.yz-roof1_top_point.yz,perp(V45)),p.x,dot(pay.yz-roof1_top_point.yz,V45));d_block1_bottom=opI(roof_plane_local_p.z,d_block1_footprint);d_block1_bottom=opI(d_block1_bottom,pay.y-hs1_in.y);d_block1_bottom=opI(d_block1_bottom,pax.x-block1_chimney_wall_plane_x);d_block1_bottom=opI(d_block1_bottom,roof_plane_local_p.z+0.002);d_block1_roof=roof_plane_local_p.z-detail*hf_SurfaceRoofTiles(roof_plane_local_p.yx*roof_tile_scl)*roof_tile_scl2;d_block1_roof=opS(d_block1_roof,roof_plane_local_p.z+0.002);d_block1_roof=opI(d_block1_roof,d_block1_footprint);d_block1_bottom2=opI(d_block1_footprint-bottom_inflate,p.z);}
+  float d_chimney=FLT_MAX;if(has_chimney){vec2 chimney_c=vec2(hs1_in.x,0);bounds2 chimney_footprint_b=mkbounds_unchecked(chimney_c-vec2(chimney_side_len),chimney_c+vec2(0,chimney_side_len*0.5));float d_chimney_footprint=sd_bounds_range(_x2chimney?abs(p.xy):p.xy,chimney_footprint_b.pmin.xy,chimney_footprint_b.pmax.xy);d_chimney=opI(chimney_bottom-p.z,opI(d_chimney_footprint,p.z-chimney_height));float d_chimney_hole=opI(chimney_bottom-p.z,opI(d_chimney_footprint,p.z-chimney_height*1.5))+0.002;d_chimney=opS(d_chimney,d_chimney_hole);}
+  float d_block2_roof=FLT_MAX;float d_block2_bottom=FLT_MAX;float d_block2_bottom2=FLT_MAX;if(hh.x>0.4){bounds2 block2=mkbounds_unchecked(-hs2,hs2);float d_block2_footprint=sd_bounds_range(p.xy,block2.pmin.xy,block2.pmax.xy);d_block2_bottom=opI(d_block2_footprint+bottom_block_inset,(p.z-h));d_block2_bottom2=opI(d_block2_footprint-bottom_inflate,p.z);vec3 roof2_corner_point=vec3(hs2,h);vec3 roof2a_plane_local_p=vec3(p.y,-dot(pax.xz-roof2_corner_point.xz,perp(V45)),dot(pax.xz-roof2_corner_point.xz,V45));float roof2detail_a=roof2a_plane_local_p.z-detail*hf_SurfaceRoofTiles(roof2a_plane_local_p.xy*roof_tile_scl)*roof_tile_scl2;vec3 roof2b_plane_local_p=vec3(p.x,-dot(pay.yz-roof2_corner_point.yz,perp(V45)),dot(pay.yz-roof2_corner_point.yz,V45));float roof2detail_b=roof2b_plane_local_p.z-detail*hf_SurfaceRoofTiles(roof2b_plane_local_p.xy*roof_tile_scl)*roof_tile_scl2;d_block2_roof=opI(roof2b_plane_local_p.z,roof2a_plane_local_p.z);d_block2_roof=opI(roof2detail_a,roof2detail_b);if(half_hipped){d_block2_roof=opI(d_block2_roof,p.y);d_block2_bottom=opI(d_block2_bottom,p.y);d_block2_bottom2=opI(d_block2_bottom2,p.y);}}
+  DistanceId bb1=MkDistanceId(d_block1_bottom,MATID_HOUSE);DistanceId bb2=MkDistanceId(d_block2_bottom,MATID_HOUSE);if(FARM_WINDOWS){addWindow(bb1,p2xface(p,vec2(hs1_in.x,0.0)),1.,hs1_in.y);addWindow(bb1,p2yface(p,vec2(0,hs1_in.y)),0.,hs1_in.x);addWindow(bb2,p2yface(p,vec2(0,hs2_in.y)),0.,hs2_in.x);}
+  DistanceId roof_eval=MkDistanceId(opI(h-p.z,opU(d_block1_roof,d_block2_roof)),MATID_ROOF);DistanceId bottom_eval=MkDistanceId(d_chimney,MATID_HOUSE);bottom_eval=opUdi(bottom_eval,bb1);bottom_eval=opUdi(bottom_eval,bb2);DistanceId bottom2_eval=MkDistanceId(opU(d_block1_bottom2,d_block2_bottom2),MATID_HOUSE_BOTTOM);return opUdi(opUdi(roof_eval,bottom_eval),bottom2_eval);
+}
+
+DistanceId sdGridObj_Farm(DistanceId di,vec3 p,CellPoint cr,float radius_fraction,float patch_id,inout vec3 color,SceneIn scenein,vec3 h_gradval,bool taylor_expansion_height){
+  vec2 c=cr.p;float r=radius_fraction*cr.pradius;float cz=CalcHeight(cr.p,p.xy,h_gradval,taylor_expansion_height);
+  vec2 e=vec2(1e-3,0);vec2 h_gradval_at_c=(vec2(BaseGroundHeight(c.xy+e.xy),BaseGroundHeight(c.xy+e.yx))-vec2(cz))/e.x;float grad_len=length(h_gradval_at_c);
+  if(grad_len>0.17)return di;cz+=r*grad_len*0.65;
+  p.xy-=c;p.z-=cz;p.xy=rotate_with_unit_vector(p.xy,grad_len>0.01?normalize(h_gradval_at_c):unit_vector2(hash1u2_4tXyWN(uvec2(cr._pi))*2.0*PI));
+  DistanceId eval=sdFarm(p,cr,patch_id,r,1.0);
+  if(IsShadeTrace(scenein.trace_flags)&&(DecodeId(eval)==MATID_ROOF))eval=MkDistanceId_16(eval.d,MATID_ROOF,hash11(patch_id));
+  return eval;
+}
+
+float sdBrickWall(vec3 p,ClosestPath path,float h){float wall_start_dist=LANEWIDTH*0.5+0.005;float wall_thickness=0.018;float wall_height=0.05;float d=FLT_MAX;for(float k=0.0;k<2.0;k+=1.0){vec3 pl=p;pl.xy=GetLocalCurvePoint(path);pl.y-=wall_start_dist+wall_thickness*0.5;pl.z-=h;vec3 s=vec3(0.01,0.006,0.006);float spacing=0.0015;vec3 cv;cv.xz=vec2(s.x+spacing,2.0*s.z+spacing);cv.y=s.y+spacing;vec2 offset=-0.5*cv.xz;float o=0.5*k;offset.xy+=o*cv.xz;vec2 i;i=floor((pl.xz-offset)/cv.xz);i.y=min(i.y,2.0);pl.xz-=i*cv.xz;pl.xz-=o*cv.xz;float r=0.002;d=opU(d,sd_bounds_range_round(pl,-s*0.5,s*0.5,r));}if(_1)d-=0.003*sfbm2_13(p*80.0);return d;}
+
+float sdGrass(vec3 p,float h){return p.z-h;}
+
+#define SD_OBJECT_CONTRIB(_di_,_object_sd_func_,_grid_offset_,_hoffset_) {CellPoint _cp_;if(GetClosestGridPointWithPathBand_x1(_cp_,p.xy,h_gradval,args,_grid_offset_,_hoffset_))_di_.object_di=_object_sd_func_(_di_.object_di,p,_cp_,radius_fraction,_di_.path.patch_di.id,eval.color,scenein,h_gradval,args.taylor_expansion_height);}
+
+void AddContributionTrees(inout SceneOut eval,SceneIn scenein,vec3 h_gradval,float groundz,vec3 patch_id_hash,int aFrame,float aTime){
+  vec3 p=scenein.p;float tree_max_radius=0.15;CloseGridPointArgsWithBand args;args.args0.cell_size=0.4;args.args0.max_radius=tree_max_radius;args.args0.radius_disparity=0.1;args.band_start=args.args0.max_radius;args.band_end=patch_id_hash.x>0.9?FLT_MAX:args.args0.max_radius*3.0;args.taylor_expansion_height=TAYLOR_HEIGHT_TREE;float grid_offset_step=0.25;float radius_fraction=1.0;
+  for(float f=0.0 FORCE_LOOPF;f<3.0;f+=1.0){SD_OBJECT_CONTRIB(eval,sdGridObj_TreeOrPine,grid_offset_step*args.args0.cell_size*f,100.0*f);}
+  float mat_id=DecodeId(eval.object_di);
+  if(DISPLACE_TREE&&((mat_id==MATID_TREE)||(mat_id==MATID_PINE))){vec3 pd=p;if(WIND_TREE_AND_PINES)pd+=ApplyWind(pd,aTime);float is_pine=(mat_id==MATID_PINE)?1.:0.;pd.z*=mix(1.,0.75,is_pine);eval.object_di.d+=sfbm2_13_leaf(pd*80.0*2.2)*TREE_SDD*mix(1.,0.4,is_pine)*0.8;}
+  if(GHOST_STEPS_TREE&&CanGhostStep(scenein,GHOST_MAX_DIST_FROM_T0,GHOST_MAX_DIST_ABS)){float cell_inflate_epsilon=0.004;GhostGridSteps(eval,scenein,grid_offset_step*args.args0.cell_size,cell_inflate_epsilon);}
+}
+
+void AddContributionFarms(inout SceneOut eval,SceneIn scenein,vec3 h_gradval,float groundz,vec3 patch_id_hash,float closest_path_middle_point_height){
+  vec3 p=scenein.p;bool is_farm_patch=patch_id_hash.x>0.2;if(!is_farm_patch)return;
+  if(FARM){CloseGridPointArgsWithBand args;args.args0.cell_size=1.2;args.args0.max_radius=0.35;args.args0.radius_disparity=0.3;args.band_start=args.args0.max_radius*1.5;args.band_end=FLT_MAX;args.taylor_expansion_height=TAYLOR_HEIGHT_FARM;float radius_fraction=0.8;SD_OBJECT_CONTRIB(eval,sdGridObj_Farm,0.0,0.0);if(GHOST_STEPS_FARM&&CanGhostStep(scenein,GHOST_MAX_DIST_FROM_T0,GHOST_MAX_DIST_ABS)){float cell_inflate_epsilon=0.004;GhostGridSteps(eval,scenein,args.args0.cell_size,cell_inflate_epsilon);}}
+  if(BRICKWALL&&patch_id_hash.y>0.7){DistanceId walls=MkDistanceId(sdBrickWall(p,eval.path,eval.base_height),MATID_BRICKWALL);eval.object_di=opUdi(eval.object_di,walls);}
+}
+
+void AddContributionGrass(inout SceneOut eval,vec3 p,float groundz,vec3 patch_id_hash){float grass_height=(groundz-0.01)+smoothstep(-0.02,0.04,abs(eval.path.patch_di.d)-LANEWIDTH*0.5)*0.0195;DistanceId grass=MkDistanceId_16(sdGrass(p,grass_height),MATID_GRASS,patch_id_hash.z);eval.object_di=opUdi(eval.object_di,grass);}
+void AddContributionPath(inout SceneOut eval,SceneIn scenein,float groundz){vec3 p=scenein.p;float path_d_min=p.z-groundz;if(!(path_d_min<eval.object_di.d))return;DistanceId path_di=MkDistanceId_16(path_d_min,MATID_GROUND,(1.0-smoothstep(0.0,0.05,eval.path.patch_di.d)));if(DISPLACE_PATH){float path_blend=1.0-smoothstep(0.001,0.008,eval.path.patch_di.d-LANEWIDTH*0.5);float distance_blend=1.0-smoothstep(6.0,7.0,scenein.t);float fade=path_blend*distance_blend;if(fade>0.0)path_di.d+=fade*sfbm2_12(GetLocalCurvePoint(eval.path)*vec2(1,2)*80.0)*DISPLACE_PATH_AMPL;}eval.object_di=opUdi(eval.object_di,path_di);}
+
+SceneOut evalScene(SceneIn scenein,int aFrame,float aTime){
+  vec3 p=scenein.p;SceneOut eval;SceneOutInit(eval);
+  float groundz=BaseGroundHeight(p.xy);eval.base_height=groundz;eval.path=EvalClosestPath(p.xy,false);vec3 h_gradval=vec3(0.0,0.0,groundz);
+#ifdef TERRAIN_WARP
+  vec3 ground_normal;
+#endif
+  if(_1||TAYLOR_HEIGHT_BUSH||TAYLOR_HEIGHT_TREE||TAYLOR_HEIGHT_FARM){vec2 e=vec2(1e-3,0);float hx=BaseGroundHeight(p.xy+e.xy);float hy=BaseGroundHeight(p.xy+e.yx);h_gradval.xy=vec2(hx-eval.base_height,hy-eval.base_height)/e.x;
+#ifdef TERRAIN_WARP
+  vec3 px=vec3(p.xy+e.xy,hx);vec3 py=vec3(p.xy+e.yx,hy);vec3 pc=vec3(p.xy,eval.base_height);ground_normal=normalize(cross(px-pc,py-pc));
+#endif
+  }
+#ifdef TERRAIN_WARP
+  eval.terrain_warp=0.0;
+  if(HasDirection(scenein.trace_flags)){float large_optimistic_step=3.0;vec3 base=vec3(p.xy,eval.base_height+bush_max_radius*2.5);Ray warp_ray;warp_ray.o=scenein.p;warp_ray.d=scenein.v;float t2=plane_trace(warp_ray,base,ground_normal,1e-3);if(t2>0.0)eval.terrain_warp=min(t2,large_optimistic_step);}
+#endif
+  vec2 closest_patch_border_point2=p.xy+eval.path.v2closest;float closest_path_middle_point_height=BaseGroundHeight(closest_patch_border_point2);eval.test2d=eval.path;
+  float d_ground_max=p.z-(eval.base_height-DISPLACE_PATH_AMPL*2.0);
+  if(GROUND_OCCLUSION)eval.object_di=MkDistanceId(d_ground_max,MATID_GROUND);
+  else eval.object_di=MkDistanceId(FLT_MAX,MATID_NONE);
+  if(GHOST_STEPS_PATCH&&CanGhostStep(scenein,GHOST_MAX_DIST_FROM_T0,GHOST_MAX_DIST_ABS)){vec3 base=vec3(p.xy+eval.path.v2closest,p.z);vec3 normal=normalize(-vec3(eval.path.v2closest,0));float t2=plane_trace(p,scenein.v,base,normal,1e-3);if(t2>0.0)eval.d_ghost=min(eval.d_ghost,max(t2,GHOST_EPS));}
+  vec3 patch_id_hash=hash42_(ivec2(int(eval.path.patch_di.id))).xyz;bool is_forest_patch=patch_id_hash.x>0.65;
+  if(is_forest_patch){if(TREE)AddContributionTrees(eval,scenein,h_gradval,groundz,patch_id_hash,aFrame,aTime);}
+  else AddContributionFarms(eval,scenein,h_gradval,groundz,patch_id_hash,closest_path_middle_point_height);
+  if(BUSH)AddContributionBushes(eval,scenein,h_gradval,groundz,patch_id_hash,is_forest_patch,aTime,aFrame);
+  if(GRASS)AddContributionGrass(eval,p,groundz,patch_id_hash);
+  if(PATH)AddContributionPath(eval,scenein,groundz);
+  return eval;
+}
+
+struct TraceOutput{float t;float dist;float shadow;};
+
+// Perfs allégées pour le mode single-pass
+#define MAX_ITERATIONS_VIEW 100
+#define MAX_ITERATIONS_SHADOW 32
+#define TMAX_VIEW 65.0
+#define TMAX_SHADOW 38.0
+#define TFRAC 0.8
+#define DBREAK 0.0025
+
+TraceOutput traceScene(Ray ray,float shadow_sharpness,int trace_flags,int max_iterations,float tfrac,float tmaxmax,float dbreak,vec2 uv,vec2 fragCoord,int aFrame,float aTime){
+  TraceOutput to;to.t=0.0;to.dist=0.0;to.shadow=1.0;float tmax=tmaxmax;
+  {float hmax=MAX_TERRAIN_HEIGHT+TALLEST_OBJECT_HEIGHT;float thit=plane_trace_z(ray,hmax,1e-4);if(thit>0.0){if(ray.o.z>hmax)to.t=thit;else tmax=min(thit,tmaxmax);}else if(ray.o.z>hmax)to.t=tmaxmax*1.1;}
+  SceneIn scenein;SetSceneInDirection(scenein,ray.o,ray.d,trace_flags);scenein.t0=to.t;
+  for(int i=0 FORCE_LOOP;i<max_iterations;++i){scenein.p=ray.o+to.t*ray.d;scenein.t=to.t;SceneOut eval=evalScene(scenein,aFrame,aTime);float d=min(eval.object_di.d,eval.d_ghost);float is_ghost_step=(d==eval.d_ghost?1.0:0.0);to.dist=d;if(IsShadowTrace(trace_flags)){to.shadow=min(to.shadow,shadow_sharpness*max(eval.object_di.d,0.0)/(to.t+1e-4));if(to.shadow<=0.01)break;}if(((is_ghost_step==0.0)&&(to.dist<=dbreak*to.t))||(to.t>tmax))break;float dt=to.dist*mix(tfrac,1.0,is_ghost_step);to.t+=dt;}
+  if(to.t>tmax)to.t=tmaxmax*1.1;return to;
+}
+
+#define TIME_OF_DAY 0.56
+vec3 get_sun_direction(float aTime){float sun_elevation=radians(mix(-30.0,90.0,TIME_OF_DAY));return zup_spherical_coords_to_vector(unit_vector2(PI*0.5-sun_elevation),V45);}
+
+// ── Nuages simplifiés (CLOUD_MODE 0) ────────────────────────────────────────
+vec3 get_cloud(vec3 v,sampler2D aChannel1,vec3 aResolution,float aTime){return vec3(0.0);}
+#define cloud_lowest_absorption_remap 0.6
+
+vec3 get_top_sky_color(bool render){return AZURE*(render?0.6:1.0);}
+vec3 get_sky_horizon_color(){return mix(WHITE,AZURE,0.4);}
+vec3 get_fog_color(){return mix(AZURE,WHITE,0.15);}
+float get_hacked_vz(vec3 v,float ez){float zmin=-max(ez,0.)/(TMAX_VIEW*1.1);return max(0.,(v.z-zmin)/(1.-zmin));}
+vec3 get_sky(vec3 v,vec3 l,float ez,bool render){float hz=get_hacked_vz(v,ez);return mix(get_sky_horizon_color(),get_top_sky_color(render),pow(hz,0.2));}
+vec3 get_sky_plus_clouds(vec3 v,vec3 l,float ez,sampler2D aChannel1,vec3 aResolution,float aTime){return get_sky(v,l,ez,true);}
+
+float sFlarePeak(vec2 p,float da,float a,float a_offset){a+=a_offset;a=floor((a/da)+0.5)*da;vec2 vv=unit_vector2(a-a_offset);return abs(dot(p,perp(vv)));}
+vec4 sunGlareCoords(mat4 cam,vec3 v,vec3 l){vec3 sy=normalize(cross(cam[0].xyz,l));vec3 sx=normalize(cross(l,sy));return vec4(normalize(vec2(dot(v,sx),dot(v,sy))),dot(v,l),-cam[2].z);}
+vec3 sunGlare(vec4 ppd,float solid_sun_disk_radius,float ray_length,float ray_thickness,float ray_thickness_disparity,float n1,float n2,float falloff_glare_attn,float falloff_glare_p1,float falloff_glare_p2,bool falloff_glare_multiplicative){vec2 anglev=ppd.xy;float v_dot_l=ppd.z;float r=safe_acos(v_dot_l)/PI;vec2 p=anglev*r;float a=calc_angle(anglev);float v=0.0;float d2=max(r-solid_sun_disk_radius,0.);float da=2.0*PI/n1;float da2=2.0*PI/(n1+n2);for(float i=0.;i<n2;++i){vec3 rr=hash31(i+1.);float rda=rr.x*da2*0.1;float d1=sFlarePeak(p,da,a,-i*da/n2+rda);if(r<solid_sun_disk_radius)d1=0.;v+=exp2(-d1*d1*ray_thickness*mix(1.0-ray_thickness_disparity,1.+ray_thickness_disparity,rr.y)-d2*ray_length*mix(0.5,1.5,rr.z));}float falloff_glare=falloff_glare_attn*(1.0-powerful_scurve(d2,falloff_glare_p1,falloff_glare_p2));v=falloff_glare_multiplicative?v*falloff_glare:v+falloff_glare;v=min(v,1.);return vec3(v);}
+#define FOG_GROUND _1
+
+vec3 shadeSample(in vec3 e,in vec3 v,mat4 cam,in vec3 p,in vec3 n,vec3 l,float shadow,TraceOutput to,float ao,vec2 uv,SceneOut eval,bool sky,sampler2D aChannel1,vec3 aResolution,float aTime){
+  vec3 col=vec3(0.);vec3 sunI=vec3(2.0);vec3 top_sky_color=get_sky(vec3(0,0,1),l,e.z,false);SG sun_lobe=CosineLobeSG(l);sun_lobe.Amplitude*=sunI;SG sky_lobe=CosineLobeSG(vec3(0,0,1));sky_lobe.Amplitude*=top_sky_color;
+  if(!sky){vec3 scene_color=vec3(0);float bush_factor=0.0;float tree_factor=0.0;float pine_factor=0.0;vec3 sky_reflection=vec3(0,0,0);vec2 mm=DecodeId_16(eval.object_di);float matid=mm.x;float matid_f=mm.y;bush_factor=smoothbump(MATID_BUSH,0.5,matid);tree_factor=smoothbump(MATID_TREE,0.5,matid);pine_factor=smoothbump(MATID_PINE,0.5,matid);vec4 mm4=DecodeId_5_5_5(eval.object_di);float tree_ao=mix(0.6,1.,smoothstep(0.,0.5,mm4.z));
+  scene_color=vec3(0)+bush_factor*eval.color+tree_factor*mix(mix(COLOR_TREE1,COLOR_TREE2,mm4.w),COLOR_TREE_SURF,0.0*mm4.y*mm4.y*mm4.y)*tree_ao+smoothbump(MATID_TRUNK,0.5,matid)*COLOR_TRUNK+smoothbump(MATID_HOUSE,0.5,matid)*COLOR_HOUSE+smoothbump(MATID_HOUSE_BOTTOM,0.5,matid)*COLOR_HOUSE_BOTTOM+smoothbump(MATID_ROOF,0.5,matid)*mix(COLOR_ROOF1,COLOR_ROOF2,matid_f)+smoothbump(MATID_BRICKWALL,0.5,matid)*COLOR_BRICKWALL+pine_factor*mix(COLOR_PINE,COLOR_PINE2,mm4.w)*tree_ao+smoothbump(MATID_GRASS,0.5,matid)*mix(COLOR_GRASS,COLOR_GRASS2,matid_f)+smoothbump(MATID_GROUND,0.5,matid)*mix(PATH_COLOR,PATH_COLOR2,matid_f)+smoothbump(MATID_NONE,0.5,matid)*MAGENTA;
+  if(MATID_WINDOW==matid){scene_color=BLACK;vec3 vr=reflect(v,n);vec3 refl_color=get_sky_plus_clouds(vr,l,p.z,aChannel1,aResolution,aTime);refl_color=mix(COLOR_GRASS*mix(0.2,1.0,shadow),refl_color,smoothstep(-0.03,-0.0,vr.z));sky_reflection=refl_color*mix(0.2,1.0,pow(1.0-saturate(dot(-v,n)),2.0));}
+  if(MATID_GRASS==matid){vec3 lf=sfbm4_33(p*40.0);float hf=sfbm1_12(p.xy*2800.0);if(matid_f>(1.-0.04)){float period=0.07;float s=stripes(rotate_with_angle(p.xy,matid_f*1000.0).x,period,period*0.25,0.004);scene_color=mix(COLOR_MOWED_GRASS,COLOR_MOWED_GRASS2,saturate(s+(lf.x-0.38)*1.5));}scene_color*=1.0-0.2*(saturate(1.0-lf.y));scene_color*=saturate(1.0-0.4*hf*saturate(1.0-lf.y));}
+  vec3 albedo=scene_color;col+=shadow*SGDiffuseFitted(sun_lobe,n,albedo);if(_1)col+=mix(SGDiffuseFitted(sky_lobe,n,albedo),top_sky_color,SHADOW_TINT_SATURATION)*mix(0.15,0.02,shadow)*ao;col+=sky_reflection;float d=length(p-e);if(FOG_GROUND)col=mix(col,get_fog_color()*0.8,(1.-exp(-0.1*max(d-6.1,0.)))*0.378);}
+  else{col=get_sky_plus_clouds(v,l,e.z,aChannel1,aResolution,aTime);if(SUN){vec4 ppd=sunGlareCoords(cam,v,l);col+=sunGlare(ppd,0.007,280.,100000.0,0.2,20.0,4.0,0.3,0.4,8.,false)*vec3(0.8,0.8,0.5)*sunI;}}
+  return col;
+}
+
+vec3 postProcess(vec3 col,vec2 uv,vec4 ppd){float exposure=3.0;col=exposure*tonemap_reinhard(col);float vignette=.0+1.*pow(20.*uv.x*uv.y*(1.-uv.x)*(1.-uv.y),0.15);col*=vignette;col=contrast(col,vec3(1.06));col=gamma_correction_itu(col);return col;}
+
+struct CameraRet{vec3 eye;vec3 target;float roll;float pitch;};
+CameraRet init_cam(){CameraRet cam;cam.roll=0.;cam.pitch=0.;return cam;}
+
+#define STICKY_MOUSE false
+mat4 look_around_mouse_control(mat4 camera,float pitch,float tan_half_fovy,vec3 aResolution,vec4 aMouse,float dmmx){float mouse_ctrl=1.0;vec2 mm_offset=vec2(dmmx,pitch);vec2 mm=vec2(0.0,0.0);if(aMouse.z>0.0||STICKY_MOUSE)mm=(aMouse.xy-aResolution.xy*0.5)/(min(aResolution.x,aResolution.y)*0.5);mm.x=-mm.x;mm=sign(mm)*pow(abs(mm),vec2(0.9));mm*=PI*tan_half_fovy*mouse_ctrl;mm+=mm_offset;return camera*yup_spherical_coords_to_matrix(mm.y,mm.x);}
+
+struct LanePoint{vec3 p;vec3 tangent2d;float lane_index;};
+LanePoint getPathPointAndDir(float x,float lane_index){LanePoint ret;vec2 y=wavyLaneFuncAndDerivative_WORLD(x,lane_index);ret.p.xy=vec2(x,y.x);ret.p.z=BaseGroundHeight(ret.p.xy)+0.032;ret.tangent2d=normalize(vec3(1.0,y.y,0));ret.lane_index=lane_index;return ret;}
+
+struct CameraData{mat4 camera;float tan_half_fovy;};
+
+// ── RANDONNÉE : caméra pilotée par uDist ─────────────────────────────────────
+// Remplace walkAndFlyCamera : pas de mode vol, avancement calé sur la distance
+// parcourue par le marcheur (uDist en mètres).
+// Facteur d'échelle : 1 unité-monde ≈ 15 m → uDist * 0.067
+CameraData GetCameraTransform(float aTime,vec4 aDate,vec3 aResolution,vec4 aMouse){
+  CameraData data;
+  data.tan_half_fovy=0.6;
+  float x=uDist*0.067; // conversion mètres → unités-monde
+  float lane_index=FIRST_LANE_INDEX;
+  LanePoint pp=getPathPointAndDir(x,lane_index);
+  CameraRet cam=init_cam();
+  cam.eye=pp.p;
+  // Regard légèrement en avant et vers le bas (posture de marche)
+  vec3 ahead=pp.p+pp.tangent2d*2.2;
+  ahead.z-=0.012;  // regard quasi-horizontal, légèrement vers le bas
+  cam.target=ahead;
+  mat4 camera=lookat(cam.eye,cam.target,vec3(0.,0.,1.));
+  data.camera=look_around_mouse_control(camera,cam.pitch,data.tan_half_fovy,aResolution,aMouse,0.0);
+  return data;
+}
+
+vec4 mainScene(vec2 fragCoord,float aTime,vec4 aDate,vec3 aResolution,int aFrame,vec4 aMouse,sampler2D aChannel1,out vec4 ppd){
+  float aspect=aResolution.x/aResolution.y;vec2 uv=fragCoord.xy/aResolution.xy;vec4 fragColor=vec4(0.0);
+  CameraData camera_data=GetCameraTransform(aTime,aDate,aResolution,aMouse);
+  Ray view_ray=get_view_ray2((uv-vec2(0.5))*2.0,aspect,1.0/camera_data.tan_half_fovy,camera_data.camera);
+  float ao=1.0;vec3 sun_direction=get_sun_direction(aTime);bool sky=false;float shadow=1.0;TraceOutput to;vec3 p2;vec3 n;SceneOut eval_for_shade;SceneOutInit(eval_for_shade);Ray trace_ray=view_ray;int trace_flags=TRACE_VIEW;int max_iterations=MAX_ITERATIONS_VIEW;float tmaxmax=TMAX_VIEW;
+  for(int pass=0 FORCE_LOOP;pass<(SHADOWS?2:1);++pass){TraceOutput tmp_to=traceScene(trace_ray,5.0,trace_flags,max_iterations,TFRAC,tmaxmax,DBREAK,uv,fragCoord,aFrame,aTime);if(pass==1){shadow=mix(0.05,1.0,smoothstep(0.4,0.6,tmp_to.shadow));break;}to=tmp_to;p2=view_ray.o+to.t*view_ray.d;sky=to.t>TMAX_VIEW;if(sky)break;
+  SceneIn scenein;scenein.p=p2;SetSceneInDirectionless(scenein,TRACE_SHADE);scenein.t=0.0;
+  {float e=1e-3*2.;vec4 v;for(int i=0 FORCE_LOOP;i<4;++i){SceneIn scenein2=scenein;if(i!=3)scenein2.p[i]+=e;eval_for_shade=evalScene(scenein2,aFrame,aTime);v[i]=eval_for_shade.object_di.d;}n=normalize(v.xyz-vec3(v.w));}
+  if(SHADOWS){vec4 mm4=DecodeId_5_5_5(eval_for_shade.object_di);float tree_ao=1.0;if((mm4.x==MATID_TREE)||(mm4.x==MATID_PINE)){tree_ao+=1.0-smoothstep(0.2,0.5,mm4.z);tree_ao-=smoothstep(-0.2,0.0,dot(sun_direction,n));tree_ao=saturate(tree_ao);}trace_ray=mkray(p2+n*mix(0.004,0.0005,tree_ao),sun_direction);trace_flags=TRACE_SHADOW;max_iterations=MAX_ITERATIONS_SHADOW;tmaxmax=TMAX_SHADOW;}}
+  fragColor.rgb=shadeSample(view_ray.o,view_ray.d,camera_data.camera,p2,n,sun_direction,shadow,to,ao,uv,eval_for_shade,sky,aChannel1,aResolution,aTime);
+  ppd=sunGlareCoords(camera_data.camera,view_ray.d,sun_direction);
+  fragColor.a=to.t;return fragColor;
+}
+
+void mainImage(out vec4 fragColor,in vec2 fragCoord){
+  vec4 ppd;
+  vec4 col=mainScene(fragCoord,iTime,iDate,iResolution,iFrame,iMouse,iChannel1,ppd);
+  col.rgb=postProcess(col.rgb,fragCoord/iResolution.xy,ppd);
+  fragColor=col;
+}
+
+void main(){ mainImage(fragColor, gl_FragCoord.xy); }
+`;
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  WebGL2 setup
+// ══════════════════════════════════════════════════════════════════════════════
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2');
+if (!gl) {
+  document.getElementById('loading').textContent = 'WebGL2 non supporté';
+  throw 'no webgl2';
+}
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+    throw gl.getShaderInfoLog(sh);
+  return sh;
+}
+
+// Compilation asynchrone via setTimeout pour ne pas geler l'UI
+let prog = null;
+setTimeout(() => {
+  try {
+    const vs = compileShader(gl.VERTEX_SHADER, VS);
+    const fs = compileShader(gl.FRAGMENT_SHADER, FS);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs); gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p);
+    prog = p;
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('hud').style.opacity = '1';
+  } catch(e) {
+    document.getElementById('loading').innerHTML = 'Erreur shader :<br><pre style="font-size:10px;text-align:left;max-width:90vw;overflow:auto">'+e+'</pre>';
+    console.error(e);
+  }
+}, 50);
+
+// Quad plein écran
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, null);
+gl.bindVertexArray(null);
+
+// Textures factices (iChannel0/1 non utilisés en CLOUD_MODE 0)
+function mkTex1x1() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  return t;
+}
+const tex0 = mkTex1x1(), tex1 = mkTex1x1();
+
+// ── État tapis ────────────────────────────────────────────────────────────────
+let speed = 4.0, dist = 0.0, elapsed = 0.0;
+let paused = false, lastT = null, frame = 0;
+let mx = 0, my = 0, mb = 0;
+
+canvas.addEventListener('mousemove', e => { mx = e.clientX; my = canvas.clientHeight - e.clientY; });
+canvas.addEventListener('mousedown', e => { mb = 1; mx = e.clientX; my = canvas.clientHeight - e.clientY; });
+canvas.addEventListener('mouseup', () => mb = 0);
+canvas.addEventListener('touchstart', e => { const t = e.touches[0]; mx=t.clientX; my=canvas.clientHeight-t.clientY; mb=1; }, {passive:true});
+canvas.addEventListener('touchmove',  e => { const t = e.touches[0]; mx=t.clientX; my=canvas.clientHeight-t.clientY; }, {passive:true});
+canvas.addEventListener('touchend',   () => mb = 0, {passive:true});
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 1.5);
+  canvas.width  = window.innerWidth  * dpr;
+  canvas.height = window.innerHeight * dpr;
+}
+resize();
+window.addEventListener('resize', resize);
+
+const ul = n => gl.getUniformLocation(prog, n);
+
+function fmtTime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+}
+
+function render(ts) {
+  requestAnimationFrame(render);
+  if (!prog) return;
+  if (!lastT) lastT = ts;
+  const delta = Math.min((ts - lastT) / 1000, 0.05);
+  lastT = ts;
+
+  if (!paused) { dist += (speed / 3.6) * delta; elapsed += delta; }
+
+  const w = canvas.width, h = canvas.height;
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(prog);
+
+  // Uniforms
+  gl.uniform3f(ul('iResolution'), w, h, 1.0);
+  gl.uniform1f(ul('iTime'), ts / 1000.0);
+  gl.uniform1i(ul('iFrame'), frame++);
+  gl.uniform4f(ul('iMouse'), mx * (w / window.innerWidth), my * (h / window.innerHeight), mb ? mx : -1, 0);
+  const d = new Date();
+  gl.uniform4f(ul('iDate'), d.getFullYear(), d.getMonth()+1, d.getDate(),
+    d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds());
+  gl.uniform1f(ul('uDist'),  dist);
+  gl.uniform1f(ul('uSpeed'), speed);
+
+  // Textures
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex0);
+  gl.uniform1i(ul('iChannel0'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tex1);
+  gl.uniform1i(ul('iChannel1'), 1);
+
+  gl.bindVertexArray(vao);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+
+  // HUD
+  document.getElementById('h1').textContent = speed.toFixed(1) + ' km/h';
+  document.getElementById('h2').textContent = (dist/1000).toFixed(2) + ' km';
+  document.getElementById('h3').textContent = fmtTime(elapsed);
+  document.getElementById('h4').textContent = Math.round(dist/0.76) + ' pas';
+}
+
+requestAnimationFrame(render);
+
+// UI
+document.getElementById('sp').addEventListener('input', e => {
+  speed = +e.target.value;
+  document.getElementById('sl').textContent = speed.toFixed(1) + ' km/h';
+});
+document.getElementById('btn').addEventListener('click', () => {
+  paused = !paused;
+  document.getElementById('btn').textContent = paused ? '▶' : '⏸';
+});
+</script>
+</body>
+</html>

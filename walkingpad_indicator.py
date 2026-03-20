@@ -427,6 +427,93 @@ class HikingVideoWindow:
         self._window.destroy()
 
 
+class HikingSimWindow:
+    """
+    Fenêtre de simulation 3D d'une randonnée en campagne anglaise.
+    Utilise WebKit2GTK (webkit2-4.1) pour exécuter le shader WebGL2 custom.
+    La caméra avance proportionnellement à la distance parcourue sur le tapis.
+
+    Créée et utilisée exclusivement depuis le thread GTK principal.
+    WebKit2 est importé en lazy au premier usage.
+    """
+
+    HTML_PATH = Path(__file__).parent / "english_lane_hike.html"
+
+    def __init__(self, on_close_cb) -> None:
+        gi.require_version('WebKit2', '4.1')
+        from gi.repository import WebKit2
+
+        self._WebKit2     = WebKit2
+        self._on_close_cb = on_close_cb
+        self._is_fullscreen = False
+        self._loaded      = False
+
+        settings = WebKit2.Settings()
+        settings.set_enable_webgl(True)
+        settings.set_hardware_acceleration_policy(
+            WebKit2.HardwareAccelerationPolicy.ALWAYS
+        )
+        settings.set_enable_javascript(True)
+        settings.set_allow_file_access_from_file_urls(True)
+        settings.set_allow_universal_access_from_file_urls(True)
+
+        self._webview = WebKit2.WebView()
+        self._webview.set_settings(settings)
+        self._webview.connect("load-changed", self._on_load_changed)
+
+        self._window = Gtk.Window()
+        self._window.set_title(
+            "Simulation 3D — Randonnée en campagne  [F11 plein écran · Échap fermer]"
+        )
+        self._window.set_default_size(1280, 720)
+        self._window.connect("key-press-event", self._on_key_press)
+        self._window.connect("destroy", self._on_destroy)
+        self._window.add(self._webview)
+        self._webview.load_uri(self.HTML_PATH.as_uri())
+        self._window.show_all()
+
+    def update_treadmill_info(self, data: dict) -> None:
+        """Push vitesse + distance vers le JS. Appelé depuis le thread GTK uniquement."""
+        if not self._loaded:
+            return
+        speed = data.get('speed', 0.0)
+        dist  = data.get('distance', 0)
+        steps = data.get('steps', 0)
+        time  = data.get('time', 0)
+        js = f"window.updateTreadmill({speed:.2f}, {dist}, {steps}, {time});"
+        self._webview.run_javascript(js, None, None, None)
+
+    def _on_load_changed(self, webview, load_event) -> None:
+        if load_event == self._WebKit2.LoadEvent.FINISHED:
+            self._loaded = True
+
+    def _toggle_fullscreen(self) -> None:
+        if self._is_fullscreen:
+            self._window.unfullscreen()
+            self._is_fullscreen = False
+        else:
+            self._window.fullscreen()
+            self._is_fullscreen = True
+
+    def _on_key_press(self, widget, event) -> bool:
+        kv = event.keyval
+        if kv == Gdk.KEY_Escape:
+            self.close()
+        elif kv in (Gdk.KEY_F11, ord('f')):
+            self._toggle_fullscreen()
+        return True
+
+    def _on_destroy(self, widget) -> None:
+        self._loaded = False
+        if self._on_close_cb:
+            cb = self._on_close_cb
+            self._on_close_cb = None
+            cb()
+
+    def close(self) -> None:
+        self._window.destroy()
+
+
 class WalkingPadIndicator:
     """
     GTK AppIndicator affichant les données BLE du WalkingPad dans la barre GNOME.
@@ -485,6 +572,7 @@ class WalkingPadIndicator:
         self._stats_window: Optional[Gtk.Window] = None
         self._detail_window: Optional[Gtk.Window] = None
         self._hiking_window: Optional[HikingVideoWindow] = None
+        self._sim_window:    Optional[HikingSimWindow]   = None
 
     # ------------------------------------------------------------------
     # Thread principal — GTK
@@ -508,6 +596,10 @@ class WalkingPadIndicator:
         item_hiking = Gtk.MenuItem(label="Randonnée")
         item_hiking.connect("activate", self._on_show_hiking_videos)
         self.menu.append(item_hiking)
+
+        item_sim = Gtk.MenuItem(label="Simulation 3D")
+        item_sim.connect("activate", self._on_show_sim)
+        self.menu.append(item_sim)
 
         self._item_pause = Gtk.CheckMenuItem(label="Veille (pause connexion)")
         self._item_pause.connect("toggled", self._on_toggle_pause)
@@ -544,6 +636,8 @@ class WalkingPadIndicator:
         self.indicator.set_label(label, self.LABEL_GUIDE)
         if self._hiking_window:
             self._hiking_window.update_treadmill_info(self._treadmill_data)
+        if self._sim_window:
+            self._sim_window.update_treadmill_info(self._treadmill_data)
         return False
 
     def _set_label_safe(self, label: str) -> None:
@@ -862,6 +956,53 @@ class WalkingPadIndicator:
                 message_type=Gtk.MessageType.ERROR,
                 buttons=Gtk.ButtonsType.OK,
                 text=f"Erreur de lecture vidéo :\n{exc}",
+            )
+            dlg.run()
+            dlg.destroy()
+
+    def _on_show_sim(self, _source=None) -> None:
+        """Ouvre ou ferme (toggle) la fenêtre de simulation 3D WebGL."""
+        if self._sim_window:
+            self._sim_window.close()
+            return
+
+        if not HikingSimWindow.HTML_PATH.is_file():
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Fichier simulation introuvable :\n{HikingSimWindow.HTML_PATH}",
+            )
+            dlg.run()
+            dlg.destroy()
+            return
+
+        try:
+            gi.require_version('WebKit2', '4.1')
+        except ValueError:
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=(
+                    "WebKit2GTK (4.1) non installé.\n\n"
+                    "Installer avec :\n"
+                    "  sudo apt install gir1.2-webkit2-4.1"
+                ),
+            )
+            dlg.run()
+            dlg.destroy()
+            return
+
+        try:
+            self._sim_window = HikingSimWindow(
+                on_close_cb=lambda: setattr(self, '_sim_window', None),
+            )
+        except Exception as exc:
+            logging.error("Impossible d'ouvrir la simulation 3D : %s", exc)
+            self._sim_window = None
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Erreur simulation 3D :\n{exc}",
             )
             dlg.run()
             dlg.destroy()
