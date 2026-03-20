@@ -9,6 +9,8 @@ body{background:#000;overflow:hidden;width:100vw;height:100vh}
 canvas{width:100%;height:100%;display:block;will-change:transform;transform:translateZ(0)}
 #hud{position:fixed;top:0;left:0;right:0;background:rgba(8,10,14,.74);padding:5px 16px;display:flex;gap:24px;justify-content:center;z-index:10;opacity:0;transition:opacity .6s}
 #hud span{color:#fff;font:13px/1.8 monospace}
+#hud button{background:none;border:none;cursor:pointer;font-size:16px;padding:0 2px;opacity:.7;transition:opacity .2s}
+#hud button:hover{opacity:1}
 #bar{position:fixed;bottom:10px;left:10px;right:10px;display:flex;align-items:center;gap:10px;background:rgba(0,0,0,.66);border-radius:7px;padding:7px 14px;z-index:10}
 #bar span{color:#9ab;font-size:11px;white-space:nowrap}
 #bar #sl{color:#fff;min-width:60px}
@@ -29,6 +31,8 @@ button{background:rgba(255,255,255,.12);border:none;border-radius:4px;color:#fff
   <span id="h2">0.00 km</span>
   <span id="h3">0:00:00</span>
   <span id="h4">0 pas</span>
+  <button id="btn-seed-default" title="Paysage par défaut">🏡</button>
+  <button id="btn-seed-random"  title="Paysage aléatoire">🎲</button>
 </div>
 <div id="bar">
   <button id="btn">⏸</button>
@@ -72,6 +76,7 @@ uniform sampler2D iChannel1;
 // ── Uniforms tapis de marche ─────────────────────────────────────────────────
 uniform float uDist;   // distance parcourue en mètres
 uniform float uSpeed;  // vitesse en km/h
+uniform float uSeed;   // décalage de lane_index → paysage différent par seed
 
 out vec4 fragColor;
 
@@ -616,7 +621,7 @@ CameraData GetCameraTransform(float aTime,vec4 aDate,vec3 aResolution,vec4 aMous
   CameraData data;
   data.tan_half_fovy=0.6;
   float x=uDist*0.067; // conversion mètres → unités-monde
-  float lane_index=FIRST_LANE_INDEX;
+  float lane_index=FIRST_LANE_INDEX + uSeed;
   LanePoint pp=getPathPointAndDir(x,lane_index);
   CameraRet cam=init_cam();
   cam.eye=pp.p;
@@ -737,6 +742,11 @@ let speed = 4.0, dist = 0.0, elapsed = 0.0;
 let paused = false, lastT = null, frame = 0;
 let mx = 0, my = 0, mb = 0;
 let _treadmill_connected = false, _treadmill_steps = 0;
+// Seed depuis l'URL (?seed=N) ou aléatoire
+const _urlSeed = new URLSearchParams(location.search).get('seed');
+let seed = _urlSeed !== null ? parseInt(_urlSeed) : Math.floor(Math.random() * 200) - 100;
+
+window.setSeed = function(n) { seed = n; };
 
 // Appelé par Python via WebKit2 run_javascript() (~1/s)
 window.updateTreadmill = function(speedKmh, distM, steps, elapsedS) {
@@ -833,6 +843,7 @@ function render(ts) {
     d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds());
   gl.uniform1f(ul('uDist'),  dist);
   gl.uniform1f(ul('uSpeed'), speed);
+  gl.uniform1f(ul('uSeed'),  seed);
 
   // Textures
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex0);
@@ -874,6 +885,12 @@ document.getElementById('sp').addEventListener('input', e => {
 document.getElementById('btn').addEventListener('click', () => {
   paused = !paused;
   document.getElementById('btn').textContent = paused ? '▶' : '⏸';
+});
+document.getElementById('btn-seed-default').addEventListener('click', () => {
+  seed = 0; dist = 0; elapsed = 0;
+});
+document.getElementById('btn-seed-random').addEventListener('click', () => {
+  seed = Math.floor(Math.random() * 200) - 100; dist = 0; elapsed = 0;
 });
 </script>
 </body>

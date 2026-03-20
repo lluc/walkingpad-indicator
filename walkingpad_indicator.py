@@ -449,8 +449,10 @@ class HikingSimWindow:
         self._api_data    = {'speed': 0.0, 'dist': 0, 'steps': 0, 'elapsed': 0}
         self._api_lock    = threading.Lock()
 
+        import random
+        self._seed = random.randint(-100, 100)
         port = self._start_http_server()
-        url  = f'http://localhost:{port}/english_lane_hike.html'
+        url  = f'http://localhost:{port}/english_lane_hike.html?seed={self._seed}'
         self._proc = subprocess.Popen(
             [
                 'chromium',
