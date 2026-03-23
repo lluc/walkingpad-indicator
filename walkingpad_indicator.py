@@ -461,6 +461,7 @@ class HikingSimWindow:
                 '--no-default-browser-check',
                 '--no-first-run',
                 '--disable-infobars',
+                '--ozone-platform=wayland',  # backend Wayland natif → tear-free (sans XWayland)
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

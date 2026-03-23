@@ -755,7 +755,7 @@ window.updateTreadmill = function(speedKmh, distM, steps, elapsedS) {
     _treadmill_connected = true;
   }
   speed   = speedKmh;
-  dist    = distM;
+  dist    = Math.max(dist, distM);  // ne jamais reculer (dead-reckoning peut dépasser la valeur tapis)
   elapsed = elapsedS;
   _treadmill_steps = steps;
 };
