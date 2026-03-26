@@ -598,6 +598,15 @@ class WalkingPadIndicator:
     # Thread principal — GTK
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _make_icon_item(label: str, icon_name: str) -> Gtk.ImageMenuItem:
+        """Crée un ImageMenuItem avec icône (déprécié GTK mais requis par libdbusmenu/AppIndicator)."""
+        item = Gtk.ImageMenuItem(label=label)
+        img  = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.MENU)
+        item.set_image(img)
+        item.set_always_show_image(True)
+        return item
+
     def _build_indicator(self) -> None:
         self.indicator = AyatanaAppIndicator3.Indicator.new(
             "walkingpad-indicator",
@@ -609,21 +618,28 @@ class WalkingPadIndicator:
 
         self.menu = Gtk.Menu()
 
-        item_stats = Gtk.MenuItem(label="Statistiques")
+        item_stats = self._make_icon_item("Statistiques", "utilities-system-monitor")
         item_stats.connect("activate", self._on_show_stats)
         self.menu.append(item_stats)
 
-        item_hiking = Gtk.MenuItem(label="Randonnée")
+        item_hiking = self._make_icon_item("Randonnée", "folder-videos")
         item_hiking.connect("activate", self._on_show_hiking_videos)
         self.menu.append(item_hiking)
 
-        item_sim = Gtk.MenuItem(label="Forêt 3D")
-        item_sim.connect("activate", self._on_show_sim)
-        self.menu.append(item_sim)
+        item_3d = self._make_icon_item("Parcours 3D", "applications-graphics")
+        submenu_3d = Gtk.Menu()
+        item_3d.set_submenu(submenu_3d)
 
-        item_sim_lane = Gtk.MenuItem(label="Chemin de campagne")
+        item_sim = self._make_icon_item("Forêt", "weather-overcast")
+        item_sim.connect("activate", self._on_show_sim)
+        submenu_3d.append(item_sim)
+
+        item_sim_lane = self._make_icon_item("Chemin de campagne", "image-x-generic")
         item_sim_lane.connect("activate", self._on_show_sim_lane)
-        self.menu.append(item_sim_lane)
+        submenu_3d.append(item_sim_lane)
+
+        submenu_3d.show_all()
+        self.menu.append(item_3d)
 
         self._item_pause = Gtk.CheckMenuItem(label="Veille (pause connexion)")
         self._item_pause.connect("toggled", self._on_toggle_pause)
@@ -631,13 +647,13 @@ class WalkingPadIndicator:
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        item_restart = Gtk.MenuItem(label="Redémarrer")
+        item_restart = self._make_icon_item("Redémarrer", "view-refresh")
         item_restart.connect("activate", self._on_restart)
         self.menu.append(item_restart)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        item_quit = Gtk.MenuItem(label="Quitter")
+        item_quit = self._make_icon_item("Quitter", "application-exit")
         item_quit.connect("activate", self._on_quit)
         self.menu.append(item_quit)
 
