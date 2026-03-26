@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
 WalkingPad GNOME Status Bar Indicator
 Affiche vitesse, distance et durée dans la barre de statut GNOME en temps réel.
@@ -440,10 +440,11 @@ class HikingSimWindow:
     Chromium est lancé en subprocess, la fenêtre est gérée par Chromium.
     """
 
-    HTML_PATH = Path(__file__).parent / "english_lane_hike.html"
+    HTML_PATH = Path(__file__).parent / "forest.html"
 
-    def __init__(self, on_close_cb) -> None:
-        self._on_close_cb = on_close_cb
+    def __init__(self, on_close_cb, html_filename: str = "forest.html") -> None:
+        self._on_close_cb  = on_close_cb
+        self._html_filename = html_filename
         self._proc        = None
         self._http_server = None
         self._api_data    = {'speed': 0.0, 'dist': 0, 'steps': 0, 'elapsed': 0}
@@ -452,7 +453,7 @@ class HikingSimWindow:
         import random
         self._seed = random.randint(-100, 100)
         port = self._start_http_server()
-        url  = f'http://localhost:{port}/english_lane_hike.html?seed={self._seed}'
+        url  = f'http://localhost:{port}/{html_filename}?seed={self._seed}'
         self._proc = subprocess.Popen(
             [
                 'chromium',
@@ -589,8 +590,9 @@ class WalkingPadIndicator:
         # --- fenêtres de statistiques (thread GTK uniquement) ---
         self._stats_window: Optional[Gtk.Window] = None
         self._detail_window: Optional[Gtk.Window] = None
-        self._hiking_window: Optional[HikingVideoWindow] = None
-        self._sim_window:    Optional[HikingSimWindow]   = None
+        self._hiking_window:      Optional[HikingVideoWindow] = None
+        self._sim_window:         Optional[HikingSimWindow]   = None
+        self._sim_window_lane:    Optional[HikingSimWindow]   = None
 
     # ------------------------------------------------------------------
     # Thread principal — GTK
@@ -615,9 +617,13 @@ class WalkingPadIndicator:
         item_hiking.connect("activate", self._on_show_hiking_videos)
         self.menu.append(item_hiking)
 
-        item_sim = Gtk.MenuItem(label="Simulation 3D")
+        item_sim = Gtk.MenuItem(label="Forêt 3D")
         item_sim.connect("activate", self._on_show_sim)
         self.menu.append(item_sim)
+
+        item_sim_lane = Gtk.MenuItem(label="Chemin de campagne")
+        item_sim_lane.connect("activate", self._on_show_sim_lane)
+        self.menu.append(item_sim_lane)
 
         self._item_pause = Gtk.CheckMenuItem(label="Veille (pause connexion)")
         self._item_pause.connect("toggled", self._on_toggle_pause)
@@ -656,6 +662,8 @@ class WalkingPadIndicator:
             self._hiking_window.update_treadmill_info(self._treadmill_data)
         if self._sim_window:
             self._sim_window.update_treadmill_info(self._treadmill_data)
+        if self._sim_window_lane:
+            self._sim_window_lane.update_treadmill_info(self._treadmill_data)
         return False
 
     def _set_label_safe(self, label: str) -> None:
@@ -979,7 +987,7 @@ class WalkingPadIndicator:
             dlg.destroy()
 
     def _on_show_sim(self, _source=None) -> None:
-        """Ouvre ou ferme (toggle) la fenêtre de simulation 3D WebGL."""
+        """Ouvre ou ferme (toggle) la fenêtre Forêt 3D (Chromium + WebGL)."""
         if self._sim_window:
             self._sim_window.close()
             return
@@ -995,32 +1003,49 @@ class WalkingPadIndicator:
             return
 
         try:
-            gi.require_version('WebKit2', '4.1')
-        except ValueError:
+            self._sim_window = HikingSimWindow(
+                on_close_cb=lambda: setattr(self, '_sim_window', None),
+            )
+        except Exception as exc:
+            logging.error("Impossible d'ouvrir la forêt 3D : %s", exc)
+            self._sim_window = None
             dlg = Gtk.MessageDialog(
                 message_type=Gtk.MessageType.ERROR,
                 buttons=Gtk.ButtonsType.OK,
-                text=(
-                    "WebKit2GTK (4.1) non installé.\n\n"
-                    "Installer avec :\n"
-                    "  sudo apt install gir1.2-webkit2-4.1"
-                ),
+                text=f"Erreur forêt 3D :\n{exc}",
+            )
+            dlg.run()
+            dlg.destroy()
+
+    def _on_show_sim_lane(self, _source=None) -> None:
+        """Ouvre ou ferme (toggle) la fenêtre Chemin de campagne (Chromium + WebGL)."""
+        if self._sim_window_lane:
+            self._sim_window_lane.close()
+            return
+
+        lane_path = Path(__file__).parent / "english_lane_hike.html"
+        if not lane_path.is_file():
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Fichier simulation introuvable :\n{lane_path}",
             )
             dlg.run()
             dlg.destroy()
             return
 
         try:
-            self._sim_window = HikingSimWindow(
-                on_close_cb=lambda: setattr(self, '_sim_window', None),
+            self._sim_window_lane = HikingSimWindow(
+                on_close_cb=lambda: setattr(self, '_sim_window_lane', None),
+                html_filename="english_lane_hike.html",
             )
         except Exception as exc:
-            logging.error("Impossible d'ouvrir la simulation 3D : %s", exc)
-            self._sim_window = None
+            logging.error("Impossible d'ouvrir le chemin de campagne : %s", exc)
+            self._sim_window_lane = None
             dlg = Gtk.MessageDialog(
                 message_type=Gtk.MessageType.ERROR,
                 buttons=Gtk.ButtonsType.OK,
-                text=f"Erreur simulation 3D :\n{exc}",
+                text=f"Erreur chemin de campagne :\n{exc}",
             )
             dlg.run()
             dlg.destroy()
