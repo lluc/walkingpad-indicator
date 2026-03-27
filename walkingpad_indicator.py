@@ -841,29 +841,59 @@ class WalkingPadIndicator:
         lbl.set_halign(Gtk.Align.START)
         vbox.pack_start(lbl, False, False, 0)
 
+        # Valeurs cumulées (30 jours)
+        cum_dist = []
+        cum_stp  = []
+        cum_dur  = []
+        _cd, _cs, _cu = 0.0, 0, 0.0
+        for d in all_days:
+            _cd += daily_dist[d]; cum_dist.append(_cd)
+            _cs += daily_stp[d];  cum_stp.append(_cs)
+            _cu += daily_dur[d];  cum_dur.append(_cu)
+
+        cum_color = '#f0c040'   # jaune/or pour toutes les lignes cumulées
+
+        def _add_cumline(ax, yvals, ylabel):
+            """Superpose la ligne cumulée sur un axe droit.
+            Le twin est mis en arrière-plan (zorder bas) pour ne pas bloquer
+            les événements pick/mouse de l'axe principal."""
+            axr = ax.twinx()
+            axr.plot(x, yvals, color=cum_color, linewidth=1.5,
+                     marker='.', markersize=4)
+            axr.set_ylabel(ylabel, color=cum_color, fontsize=8)
+            axr.tick_params(axis='y', colors=cum_color, labelsize=7)
+            axr.spines['right'].set_color(cum_color)
+            # Laisser passer les événements vers l'axe principal
+            axr.set_zorder(ax.get_zorder() - 1)
+            ax.patch.set_visible(False)   # fond transparent pour voir la ligne
+            return axr
+
         # Figure matplotlib
         fig = Figure(figsize=(9, 7), tight_layout=True)
         color = '#4c9be8'
 
         ax1 = fig.add_subplot(3, 1, 1)
         ax1.bar(x, [daily_dist[d] for d in all_days], color=color)
-        ax1.set_ylabel('km')
-        ax1.set_title('Distance par jour')
+        ax1.set_ylabel('km / jour')
+        ax1.set_title('Distance par jour  +  cumulé (—)')
         ax1.set_xticks(x)
         ax1.set_xticklabels([])
+        _add_cumline(ax1, cum_dist, 'km cumulé')
 
         ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
         bars2 = ax2.bar(x, [daily_stp[d] for d in all_days], color='#6cc86c', picker=True)
-        ax2.set_ylabel('pas')
-        ax2.set_title('Pas par jour')
+        ax2.set_ylabel('pas / jour')
+        ax2.set_title('Pas par jour  +  cumulé (—)')
         ax2.set_xticklabels([])
+        _add_cumline(ax2, [v / 1000 for v in cum_stp], 'K pas cumulés')
 
         ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
         ax3.bar(x, [daily_dur[d] for d in all_days], color='#e88c4c')
-        ax3.set_ylabel('min')
-        ax3.set_title('Durée par jour')
+        ax3.set_ylabel('min / jour')
+        ax3.set_title('Durée par jour  +  cumulé (—)')
         ax3.set_xticks(x)
         ax3.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        _add_cumline(ax3, [v / 60 for v in cum_dur], 'h cumulées')
 
         canvas = FigureCanvas(fig)
         canvas.set_size_request(840, 600)
