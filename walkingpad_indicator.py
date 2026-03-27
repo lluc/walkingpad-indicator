@@ -430,6 +430,29 @@ class HikingVideoWindow:
         self._window.destroy()
 
 
+# Sous-processus PIP lancé avec GDK_BACKEND=x11 (XWayland).
+# set_keep_above(True) est ignoré sous Wayland pur (xdg-shell n'expose pas
+# "always-on-top" pour les fenêtres normales). Avec x11/XWayland, GTK pose
+# _NET_WM_STATE_ABOVE que GNOME Shell respecte.
+_PIP_SCRIPT = """\
+import sys, gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('WebKit2', '4.1')
+from gi.repository import Gtk, WebKit2
+win = Gtk.Window()
+win.set_title('WalkingPad PIP')
+win.set_default_size(480, 270)
+win.set_keep_above(True)
+win.set_resizable(True)
+wv = WebKit2.WebView()
+wv.load_uri(sys.argv[1])
+win.add(wv)
+win.show_all()
+win.connect('destroy', Gtk.main_quit)
+Gtk.main()
+"""
+
+
 class HikingSimWindow:
     """
     Fenêtre de simulation 3D via Chromium en mode --app.
@@ -449,6 +472,7 @@ class HikingSimWindow:
         self._http_server = None
         self._api_data    = {'speed': 0.0, 'dist': 0, 'steps': 0, 'elapsed': 0}
         self._api_lock    = threading.Lock()
+        self._pip_proc: Optional[subprocess.Popen] = None
 
         import random
         self._seed = random.randint(-100, 100)
@@ -476,9 +500,10 @@ class HikingSimWindow:
             s.bind(('localhost', 0))
             port = s.getsockname()[1]
 
-        html_dir = str(self.HTML_PATH.parent)
-        api_data = self._api_data
-        api_lock = self._api_lock
+        html_dir    = str(self.HTML_PATH.parent)
+        api_data    = self._api_data
+        api_lock    = self._api_lock
+        pip_trigger = self._launch_pip   # référence pour la closure
 
         class _Handler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
@@ -493,6 +518,13 @@ class HikingSimWindow:
                     self.send_header('Cache-Control', 'no-cache')
                     self.end_headers()
                     self.wfile.write(body)
+                elif self.path.startswith('/api/pip'):
+                    from urllib.parse import urlparse, parse_qs
+                    qs   = parse_qs(urlparse(self.path).query)
+                    seed = qs.get('seed', ['0'])[0]
+                    GLib.idle_add(pip_trigger, seed)
+                    self.send_response(204)
+                    self.end_headers()
                 else:
                     super().do_GET()
 
@@ -503,6 +535,30 @@ class HikingSimWindow:
         t = threading.Thread(target=self._http_server.serve_forever, daemon=True)
         t.start()
         return port
+
+    def _launch_pip(self, seed: str = '0') -> bool:
+        """
+        Lance la fenêtre PIP dans un sous-processus avec GDK_BACKEND=x11.
+        XWayland honore _NET_WM_STATE_ABOVE (set_keep_above), contrairement
+        au backend Wayland natif qui ignore cette requête.
+        Appelé depuis GLib.idle_add (thread principal GTK).
+        """
+        if self._pip_proc and self._pip_proc.poll() is None:
+            return False   # déjà ouverte
+        try:
+            port = self._http_server.server_address[1]
+            url  = f'http://localhost:{port}/{self._html_filename}?seed={seed}&pip=1'
+            env  = os.environ.copy()
+            env['GDK_BACKEND'] = 'x11'
+            self._pip_proc = subprocess.Popen(
+                [sys.executable, '-c', _PIP_SCRIPT, url],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logging.warning("Impossible de lancer le PIP : %s", exc)
+        return False  # GLib.idle_add ne répète pas
 
     def update_treadmill_info(self, data: dict) -> None:
         """Met à jour les données tapis exposées via /api/treadmill."""

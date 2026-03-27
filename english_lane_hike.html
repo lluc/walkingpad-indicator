@@ -33,6 +33,7 @@ button{background:rgba(255,255,255,.12);border:none;border-radius:4px;color:#fff
   <span id="h4">0 pas</span>
   <button id="btn-seed-default" title="Paysage par défaut">🏡</button>
   <button id="btn-seed-random"  title="Paysage aléatoire">🎲</button>
+  <button id="btn-pip" title="Picture-in-Picture (fenêtre flottante)">⧉</button>
 </div>
 <div id="bar">
   <button id="btn">⏸</button>
@@ -891,6 +892,24 @@ document.getElementById('btn-seed-default').addEventListener('click', () => {
 });
 document.getElementById('btn-seed-random').addEventListener('click', () => {
   seed = Math.floor(Math.random() * 200) - 100; dist = 0; elapsed = 0;
+});
+
+// ── Mode PIP ─────────────────────────────────────────────────────────────────
+const _pip = new URLSearchParams(location.search).get('pip') === '1';
+if (_pip) {
+  document.getElementById('bar').style.display = 'none';
+  document.getElementById('btn-seed-default').style.display = 'none';
+  document.getElementById('btn-seed-random').style.display  = 'none';
+  document.getElementById('btn-pip').style.display          = 'none';
+  const hud = document.getElementById('hud');
+  hud.style.opacity = '1';
+  hud.style.background = 'rgba(0,0,0,0.55)';
+}
+
+document.getElementById('btn-pip').addEventListener('click', () => {
+  if (location.protocol === 'http:' || location.protocol === 'https:') {
+    fetch('/api/pip?seed=' + seed).catch(() => {});
+  }
 });
 </script>
 </body>
