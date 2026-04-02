@@ -794,7 +794,7 @@ class WalkingPadIndicator:
         sessions = self._load_sessions()
 
         win = Gtk.Window(title="WalkingPad — Statistiques (30 derniers jours)")
-        win.set_default_size(860, 700)
+        win.set_default_size(860, 900)
         win.connect("destroy", lambda w: setattr(self, '_stats_window', None))
         self._stats_window = win
 
@@ -827,6 +827,9 @@ class WalkingPadIndicator:
             daily_stp[d]  += s.get('steps', 0)
             daily_dur[d]  += s.get('duration_s', 0) / 60.0
 
+        # Temps équivalent à 2,5 km/h (en minutes)
+        daily_equiv = {d: daily_dist[d] / 2.5 * 60 for d in all_days}
+
         x      = list(range(len(all_days)))
         labels = [datetime.date.fromisoformat(d).strftime('%d/%m') for d in all_days]
 
@@ -842,14 +845,16 @@ class WalkingPadIndicator:
         vbox.pack_start(lbl, False, False, 0)
 
         # Valeurs cumulées (30 jours)
-        cum_dist = []
-        cum_stp  = []
-        cum_dur  = []
-        _cd, _cs, _cu = 0.0, 0, 0.0
+        cum_dist  = []
+        cum_stp   = []
+        cum_dur   = []
+        cum_equiv = []
+        _cd, _cs, _cu, _ce = 0.0, 0, 0.0, 0.0
         for d in all_days:
-            _cd += daily_dist[d]; cum_dist.append(_cd)
-            _cs += daily_stp[d];  cum_stp.append(_cs)
-            _cu += daily_dur[d];  cum_dur.append(_cu)
+            _cd += daily_dist[d];  cum_dist.append(_cd)
+            _cs += daily_stp[d];   cum_stp.append(_cs)
+            _cu += daily_dur[d];   cum_dur.append(_cu)
+            _ce += daily_equiv[d]; cum_equiv.append(_ce)
 
         cum_color = '#f0c040'   # jaune/or pour toutes les lignes cumulées
 
@@ -869,10 +874,10 @@ class WalkingPadIndicator:
             return axr
 
         # Figure matplotlib
-        fig = Figure(figsize=(9, 7), tight_layout=True)
+        fig = Figure(figsize=(9, 9), tight_layout=True)
         color = '#4c9be8'
 
-        ax1 = fig.add_subplot(3, 1, 1)
+        ax1 = fig.add_subplot(4, 1, 1)
         ax1.bar(x, [daily_dist[d] for d in all_days], color=color)
         ax1.set_ylabel('km / jour')
         ax1.set_title('Distance par jour  +  cumulé (—)')
@@ -880,23 +885,32 @@ class WalkingPadIndicator:
         ax1.set_xticklabels([])
         _add_cumline(ax1, cum_dist, 'km cumulé')
 
-        ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
+        ax2 = fig.add_subplot(4, 1, 2, sharex=ax1)
         bars2 = ax2.bar(x, [daily_stp[d] for d in all_days], color='#6cc86c', picker=True)
         ax2.set_ylabel('pas / jour')
         ax2.set_title('Pas par jour  +  cumulé (—)')
         ax2.set_xticklabels([])
         _add_cumline(ax2, [v / 1000 for v in cum_stp], 'K pas cumulés')
 
-        ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
+        ax3 = fig.add_subplot(4, 1, 3, sharex=ax1)
         ax3.bar(x, [daily_dur[d] for d in all_days], color='#e88c4c')
         ax3.set_ylabel('min / jour')
         ax3.set_title('Durée par jour  +  cumulé (—)')
         ax3.set_xticks(x)
-        ax3.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        ax3.set_xticklabels([])
         _add_cumline(ax3, [v / 60 for v in cum_dur], 'h cumulées')
 
+        ax4 = fig.add_subplot(4, 1, 4, sharex=ax1)
+        ax4.bar(x, [daily_equiv[d] for d in all_days], color='#c87cc8')
+        ax4.axhline(y=90, color='#888888', linestyle='--', linewidth=1, label='1h30')
+        ax4.set_ylabel('min éq. 2,5 km/h')
+        ax4.set_title('Temps équivalent à 2,5 km/h  +  cumulé (—)')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+        _add_cumline(ax4, [v / 60 for v in cum_equiv], 'h cumulées')
+
         canvas = FigureCanvas(fig)
-        canvas.set_size_request(840, 600)
+        canvas.set_size_request(840, 780)
         vbox.pack_start(canvas, True, True, 0)
 
         # Clic sur une barre de pas → détail horaire
