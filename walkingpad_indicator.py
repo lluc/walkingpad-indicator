@@ -878,7 +878,7 @@ class WalkingPadIndicator:
         color = '#4c9be8'
 
         ax1 = fig.add_subplot(4, 1, 1)
-        ax1.bar(x, [daily_dist[d] for d in all_days], color=color)
+        bars1 = ax1.bar(x, [daily_dist[d] for d in all_days], color=color)
         ax1.set_ylabel('km / jour')
         ax1.set_title('Distance par jour  +  cumulé (—)')
         ax1.set_xticks(x)
@@ -893,7 +893,7 @@ class WalkingPadIndicator:
         _add_cumline(ax2, [v / 1000 for v in cum_stp], 'K pas cumulés')
 
         ax3 = fig.add_subplot(4, 1, 3, sharex=ax1)
-        ax3.bar(x, [daily_dur[d] for d in all_days], color='#e88c4c')
+        bars3 = ax3.bar(x, [daily_dur[d] for d in all_days], color='#e88c4c')
         ax3.set_ylabel('min / jour')
         ax3.set_title('Durée par jour  +  cumulé (—)')
         ax3.set_xticks(x)
@@ -901,7 +901,7 @@ class WalkingPadIndicator:
         _add_cumline(ax3, [v / 60 for v in cum_dur], 'h cumulées')
 
         ax4 = fig.add_subplot(4, 1, 4, sharex=ax1)
-        ax4.bar(x, [daily_equiv[d] for d in all_days], color='#c87cc8')
+        bars4 = ax4.bar(x, [daily_equiv[d] for d in all_days], color='#c87cc8')
         ax4.axhline(y=90, color='#888888', linestyle='--', linewidth=1, label='1h30')
         ax4.set_ylabel('min éq. 2,5 km/h')
         ax4.set_title('Temps équivalent à 2,5 km/h  +  cumulé (—)')
@@ -926,15 +926,53 @@ class WalkingPadIndicator:
 
         fig.canvas.mpl_connect('pick_event', _on_pick)
 
-        # Curseur pointer au survol de ax2
+        # Tooltip au survol des barres + curseur pointer sur ax2
+        _tip_kw = dict(xy=(0, 0), xytext=(0, 10), textcoords='offset points',
+                       bbox=dict(boxstyle='round,pad=0.3',
+                                 fc='#ffffdd', ec='#888888', alpha=0.9),
+                       fontsize=8, ha='center', va='bottom', annotation_clip=False)
+        _tooltips = {}
+        for ax in (ax1, ax2, ax3, ax4):
+            tip = ax.annotate('', **_tip_kw)
+            tip.set_visible(False)
+            _tooltips[ax] = tip
+
+        _bar_map = {
+            ax1: (bars1, [daily_dist[d] for d in all_days],  '{:.2f} km'),
+            ax2: (bars2, [daily_stp[d] for d in all_days],   '{:,} pas'),
+            ax3: (bars3, [daily_dur[d] for d in all_days],   '{:.0f} min'),
+            ax4: (bars4, [daily_equiv[d] for d in all_days], '{:.0f} min'),
+        }
+
         def _on_motion(event):
             gdk_win = canvas.get_window()
             if gdk_win is None:
                 return
+            # Curseur pointer sur ax2 (barres cliquables)
             if event.inaxes is ax2:
                 gdk_win.set_cursor(Gdk.Cursor.new_from_name(canvas.get_display(), 'pointer'))
             else:
                 gdk_win.set_cursor(None)
+            # Tooltip
+            found = False
+            if event.inaxes in _bar_map:
+                bars, vals, fmt = _bar_map[event.inaxes]
+                tip = _tooltips[event.inaxes]
+                for i, bar in enumerate(bars):
+                    if bar.contains(event)[0]:
+                        tip.set_text(fmt.format(vals[i]))
+                        tip.xy = (bar.get_x() + bar.get_width() / 2,
+                                  bar.get_height())
+                        tip.set_visible(True)
+                        found = True
+                        break
+                if not found:
+                    tip.set_visible(False)
+            # Masquer les tooltips des autres axes
+            for ax, tip in _tooltips.items():
+                if ax is not event.inaxes:
+                    tip.set_visible(False)
+            fig.canvas.draw_idle()
 
         fig.canvas.mpl_connect('motion_notify_event', _on_motion)
 
